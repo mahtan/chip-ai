@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -1960,7 +1960,8 @@ raccourcis
 def print_banner(provider, cfg):
     """Two compact lines: on a 16-row screen every line counts."""
     warn = "" if provider.get("api_key") else " (pas de cle)"
-    bits = [f"{provider['name']}/{provider['model']}"]
+    model = provider.get("model") or "(aucun modele)"
+    bits = [f"{provider['name']}/{model}"]
     if cfg.get("auto_approve"):
         bits.append("yolo")
     try:
@@ -2292,8 +2293,10 @@ def main(argv=None):
     parser.add_argument("--config", action="store_true", help="print config path & exit")
     parser.add_argument(
         "--set-key",
-        metavar="KEY",
-        help="save an API key for the selected provider into the config, then exit",
+        nargs="?",
+        const="-",  # bare --set-key prompts instead, keeping it out of history
+        metavar="CLE",
+        help="save an API key for this provider (omit the value to type it hidden)",
     )
     parser.add_argument(
         "--update", action="store_true", help="check for updates, install, then exit"
@@ -2322,7 +2325,28 @@ def main(argv=None):
 
     if args.set_key:
         prov_name = args.provider or cfg.get("provider", "opencode")
-        path = save_key(prov_name, args.set_key)
+        key = args.set_key
+        if key == "-":
+            # typed hidden, so the secret never reaches the shell history
+            import getpass
+
+            try:
+                key = getpass.getpass(f"cle API pour '{prov_name}' (masquee) : ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            key = key.strip()
+            if not key:
+                die("aucune cle saisie.")
+        else:
+            eprint(
+                yellow(
+                    "attention : une cle passee en argument reste dans "
+                    "l'historique du shell.\nprefere `pia --set-key` sans "
+                    "valeur, la saisie sera masquee."
+                )
+            )
+        path = save_key(prov_name, key)
         print(green(f"clé enregistrée pour '{prov_name}' dans {path}"))
         return
 

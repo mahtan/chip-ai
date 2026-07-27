@@ -67,13 +67,19 @@ Relancer `sh install.sh` plus tard **met à jour le programme** sans jamais
 > l'URL de l'autre donne une erreur 403. Choisis `-p opencode` ou
 > `-p opencode-go` selon ton abonnement.
 
-Le plus simple, enregistre-la de façon **permanente** dans la config (fichier en
-permissions `600`, jamais versionné) :
+Enregistre-la de façon **permanente** dans la config (fichier en permissions
+`600`, jamais versionné). **Omets la valeur** : la saisie sera masquée, et la
+clé n'atteindra jamais l'historique de ton shell.
 
 ```sh
-pia -p opencode --set-key TA_CLE      # OpenCode Zen
-pia -p kimi     --set-key TA_CLE      # Kimi/Moonshot
+pia -p opencode-go --set-key      # puis tape la clé, elle ne s'affiche pas
+pia -p kimi        --set-key
 ```
+
+> ⚠️ `pia --set-key sk-…` fonctionne aussi mais **laisse la clé dans
+> `~/.bash_history`**. `pia` t'avertit dans ce cas. Si ça t'est arrivé,
+> révoque la clé chez ton fournisseur et purge l'historique :
+> `sed -i '/set-key/d' ~/.bash_history && history -c && history -r`
 
 > Alternative : exporter une variable d'environnement dans `~/.profile`
 > (`export OPENCODE_ZEN_API_KEY=...`). La variable a priorité sur la config.
