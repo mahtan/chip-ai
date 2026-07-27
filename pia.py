@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-chip - a tiny AI coding agent for the Pocket C.H.I.P (and other small ARM boxes).
+pia - a tiny AI coding agent for the Pocket C.H.I.P (and other small ARM boxes).
 
 Design goals:
   * Pure Python 3 standard library. No pip, no build step, no dependencies.
@@ -23,8 +23,14 @@ import textwrap
 import urllib.error
 import urllib.request
 
-APP_NAME = "chip"
+APP_NAME = "pia"
 VERSION = "0.1.0"
+
+# path of the currently running script (the installed binary, or pia.py in-repo)
+try:
+    SELF_PATH = os.path.realpath(__file__)
+except NameError:  # pragma: no cover - frozen/interactive
+    SELF_PATH = os.path.realpath(sys.argv[0])
 
 # ---------------------------------------------------------------------------
 # Config
@@ -84,12 +90,18 @@ DEFAULT_CONFIG = {
     "stream": True,
     "max_steps": 25,
     "request_timeout": 180,
+    "update": {
+        # repo_dir is filled in by install.sh (path of your local git clone).
+        "enabled": True,
+        "repo_dir": "",
+        "timeout": 12,
+    },
 }
 
 
 def config_path():
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "chip-ai", "config.json")
+    return os.path.join(base, APP_NAME, "config.json")
 
 
 def load_config():
@@ -108,15 +120,136 @@ def load_config():
             eprint(f"warning: could not read {path}: {e}")
 
     # environment overrides
-    if os.environ.get("CHIP_PROVIDER"):
-        cfg["provider"] = os.environ["CHIP_PROVIDER"]
-    if os.environ.get("CHIP_MODEL"):
+    if os.environ.get("PIA_PROVIDER"):
+        cfg["provider"] = os.environ["PIA_PROVIDER"]
+    if os.environ.get("PIA_MODEL"):
         prov = cfg["providers"].setdefault(cfg["provider"], {})
-        prov["model"] = os.environ["CHIP_MODEL"]
-    if os.environ.get("CHIP_BASE_URL"):
+        prov["model"] = os.environ["PIA_MODEL"]
+    if os.environ.get("PIA_BASE_URL"):
         prov = cfg["providers"].setdefault(cfg["provider"], {})
-        prov["base_url"] = os.environ["CHIP_BASE_URL"]
+        prov["base_url"] = os.environ["PIA_BASE_URL"]
     return cfg
+
+
+def save_key(provider_name, key):
+    """Persist an API key for a provider into the user config file (chmod 600)."""
+    path = config_path()
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data.setdefault("providers", {})
+    # start from the built-in provider defaults if this one is new
+    if provider_name not in data["providers"]:
+        data["providers"][provider_name] = dict(
+            BUILTIN_PROVIDERS.get(provider_name, {})
+        )
+    data["providers"][provider_name]["api_key"] = key
+    data.setdefault("provider", provider_name)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    try:
+        os.chmod(path, 0o600)  # keep the key readable only by the owner
+    except Exception:
+        pass
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Self-update (git-based, works with private repos via your git credentials)
+# ---------------------------------------------------------------------------
+def _run_git(repo_dir, git_args, timeout=12):
+    try:
+        p = subprocess.run(
+            ["git", "-C", repo_dir] + git_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        return (
+            p.returncode,
+            p.stdout.decode("utf-8", "replace").strip(),
+            p.stderr.decode("utf-8", "replace").strip(),
+        )
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def update_info(cfg):
+    """Return (n_commits_behind, repo_dir, branch) if updates exist, else None.
+
+    Stays silent (returns None) on any problem: disabled, no clone, no git,
+    offline, detached head, etc. — startup must never break because of this.
+    """
+    upd = cfg.get("update") or {}
+    if not upd.get("enabled", True):
+        return None
+    repo_dir = upd.get("repo_dir") or ""
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return None
+    if not shutil.which("git"):
+        return None
+    timeout = int(upd.get("timeout", 12))
+    rc, _, _ = _run_git(repo_dir, ["fetch", "--quiet"], timeout=timeout)
+    if rc != 0:
+        return None
+    rc, branch, _ = _run_git(repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if rc != 0 or not branch or branch == "HEAD":
+        return None
+    rc, count, _ = _run_git(repo_dir, ["rev-list", "--count", "HEAD..@{u}"])
+    if rc != 0 or not count.isdigit() or int(count) <= 0:
+        return None
+    return int(count), repo_dir, branch
+
+
+def apply_update(repo_dir):
+    """git pull --ff-only, then copy the fresh pia.py over the running binary.
+
+    Returns (ok, message).
+    """
+    rc, out, err = _run_git(repo_dir, ["pull", "--ff-only"], timeout=90)
+    if rc != 0:
+        return False, (err or out or "git pull a échoué")
+    src = os.path.join(repo_dir, "pia.py")
+    try:
+        if os.path.exists(src) and os.path.realpath(src) != SELF_PATH:
+            shutil.copyfile(src, SELF_PATH)
+            os.chmod(SELF_PATH, 0o755)
+    except Exception as e:
+        return False, f"maj récupérée mais copie vers {SELF_PATH} impossible : {e}"
+    return True, (out or "à jour")
+
+
+def offer_update(cfg, restart_argv=None):
+    """Check for updates and, if the user agrees, apply and (optionally) restart.
+
+    restart_argv: if given, re-exec with these args after a successful update.
+    Returns True if an update was applied.
+    """
+    info = update_info(cfg)
+    if not info:
+        return False
+    n, repo_dir, branch = info
+    plural = "s" if n > 1 else ""
+    print(yellow(f"{n} mise{plural} à jour disponible{plural} sur « {branch} »."))
+    if not confirm("Mettre à jour maintenant ?"):
+        return False
+    ok, msg = apply_update(repo_dir)
+    if not ok:
+        eprint(red("échec de la mise à jour : " + msg))
+        return False
+    print(green("mis à jour."))
+    if restart_argv is not None:
+        print(dim("redémarrage…"))
+        os.execv(sys.executable, [sys.executable, SELF_PATH] + restart_argv)
+    return True
 
 
 def resolve_provider(cfg, provider_name=None):
@@ -132,7 +265,7 @@ def resolve_provider(cfg, provider_name=None):
         key = prov["api_key"]
     else:
         env_name = prov.get("api_key_env", "")
-        key = os.environ.get(env_name) or os.environ.get("CHIP_API_KEY")
+        key = os.environ.get(env_name) or os.environ.get("PIA_API_KEY")
     prov["api_key"] = key
     return prov
 
@@ -384,7 +517,7 @@ TOOL_SCHEMA = [
 ]
 
 SYSTEM_PROMPT = (
-    "You are chip, a concise AI coding assistant running in a terminal on a small "
+    "You are pia, a concise AI coding assistant running in a terminal on a small "
     "ARM computer (a Pocket C.H.I.P). Keep answers short and to the point; the "
     "screen is tiny. You can inspect and modify the local project using the "
     "provided tools: read_file, write_file, str_replace, list_dir, run_bash. "
@@ -585,6 +718,7 @@ commands:
   /provider [name] show or switch provider
   /yolo            toggle auto-approve for write/edit/run
   /cwd [dir]       show or change working directory
+  /update          check the git repo for updates and offer to install
   /tools           list available tools
   /exit, /quit     leave (Ctrl-D also works)
 Type anything else to talk to the model."""
@@ -602,18 +736,25 @@ def print_banner(provider, cfg):
     print(dim("type /help for commands, Ctrl-D to quit"))
 
 
-def repl(cfg, provider):
+def repl(cfg, provider, check_update=True):
     try:
         import readline  # noqa: F401  (enables line editing/history if available)
     except Exception:
         pass
+
+    # propose an update before starting the session (silent if none / offline)
+    if check_update:
+        try:
+            offer_update(cfg, restart_argv=[a for a in sys.argv[1:]])
+        except Exception:
+            pass
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     print_banner(provider, cfg)
 
     while True:
         try:
-            line = input(bold(green("\nchip> ")))
+            line = input(bold(green(f"\n{APP_NAME}> ")))
         except EOFError:
             print()
             break
@@ -656,6 +797,9 @@ def repl(cfg, provider):
                     except Exception as e:
                         eprint(red(str(e)))
                 print(dim(os.getcwd()))
+            elif cmd == "/update":
+                if not offer_update(cfg, restart_argv=[a for a in sys.argv[1:]]):
+                    print(dim("déjà à jour (ou vérification impossible)."))
             elif cmd == "/tools":
                 for name in TOOLS:
                     print(dim("  " + name))
@@ -698,6 +842,17 @@ def main(argv=None):
     parser.add_argument("--no-stream", action="store_true", help="disable streaming")
     parser.add_argument("--yolo", action="store_true", help="auto-approve all actions")
     parser.add_argument("--config", action="store_true", help="print config path & exit")
+    parser.add_argument(
+        "--set-key",
+        metavar="KEY",
+        help="save an API key for the selected provider into the config, then exit",
+    )
+    parser.add_argument(
+        "--update", action="store_true", help="check for updates, install, then exit"
+    )
+    parser.add_argument(
+        "--no-update", action="store_true", help="skip the startup update check"
+    )
     parser.add_argument("--version", action="store_true")
     args = parser.parse_args(argv)
 
@@ -709,6 +864,17 @@ def main(argv=None):
         return
 
     cfg = load_config()
+
+    if args.set_key:
+        prov_name = args.provider or cfg.get("provider", "opencode")
+        path = save_key(prov_name, args.set_key)
+        print(green(f"clé enregistrée pour '{prov_name}' dans {path}"))
+        return
+
+    if args.update:
+        if not offer_update(cfg):
+            print(dim("déjà à jour (ou vérification impossible)."))
+        return
     if args.no_stream:
         cfg["stream"] = False
     if args.yolo:
@@ -721,18 +887,19 @@ def main(argv=None):
         provider["base_url"] = args.base_url
 
     if not provider.get("api_key"):
-        env_name = provider.get("api_key_env", "CHIP_API_KEY")
+        env_name = provider.get("api_key_env", "PIA_API_KEY")
         eprint(
             yellow(
-                f"note: no API key found. Set {env_name} (or CHIP_API_KEY), e.g.\n"
-                f"  export {env_name}=sk-..."
+                f"note: pas de clé API trouvée. Enregistre-la une fois pour toutes :\n"
+                f"  {APP_NAME} -p {provider['name']} --set-key TA_CLE\n"
+                f"ou exporte {env_name} (ou PIA_API_KEY) dans ton shell."
             )
         )
 
     if args.prompt:
         one_shot(cfg, provider, " ".join(args.prompt))
     else:
-        repl(cfg, provider)
+        repl(cfg, provider, check_update=not args.no_update)
 
 
 if __name__ == "__main__":

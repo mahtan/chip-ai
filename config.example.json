@@ -25,5 +25,10 @@
   "auto_approve": false,
   "stream": true,
   "max_steps": 25,
-  "request_timeout": 180
+  "request_timeout": 180,
+  "update": {
+    "enabled": true,
+    "repo_dir": "",
+    "timeout": 12
+  }
 }

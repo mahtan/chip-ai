@@ -1,11 +1,11 @@
-# chip
+# pia
 
 Un mini agent de codage IA en terminal, pensé pour le **Pocket C.H.I.P** et
 autres petites machines ARM. Dans l'esprit de Claude Code / OpenCode / Kimi CLI,
 mais réduit à l'essentiel pour tenir sur **512 Mo de RAM, un cœur ARMv7 et un
-petit écran**.
+petit écran**. La commande à taper est **`pia`**.
 
-- **Un seul fichier Python** (`chip.py`), **zéro dépendance** (bibliothèque
+- **Un seul fichier Python** (`pia.py`), **zéro dépendance** (bibliothèque
   standard uniquement). Pas de `pip`, pas de `node`, pas de compilation.
 - Compatible avec **n'importe quelle API au format OpenAI** : OpenCode Zen,
   Kimi/Moonshot, OpenAI, ou un serveur local (`llama.cpp`, Ollama…).
@@ -13,6 +13,7 @@ petit écran**.
   exécution de commandes shell — avec confirmation avant toute action qui
   modifie quelque chose.
 - Réponses **streamées** pour la réactivité même sur connexion lente.
+- **Clé API enregistrée une fois pour toutes** et **auto-update** au démarrage.
 
 Requiert **Python 3.6+**. (Debian 11 « bullseye » du Pocket C.H.I.P fournit
 Python 3.9 : parfait, rien à installer.)
@@ -27,18 +28,21 @@ cd chip-ai
 sh install.sh
 ```
 
-Le script copie `chip` dans `~/.local/bin`, crée `~/.config/chip-ai/config.json`
-et te rappelle d'ajouter `~/.local/bin` à ton `PATH`.
+Le script :
+- copie `pia` dans `~/.local/bin`,
+- crée `~/.config/pia/config.json` (en migrant une éventuelle ancienne config),
+- enregistre le chemin de ce clone git pour l'**auto-update**,
+- supprime l'ancien binaire `chip` s'il traînait.
 
-> Pas envie d'installer ? `python3 chip.py` marche directement depuis le dossier.
+> Pas envie d'installer ? `python3 pia.py` marche directement depuis le dossier.
 
 ---
 
 ## Configuration
 
-### 1. La clé API
+### 1. Enregistrer la clé API (une seule fois)
 
-`chip` a besoin d'une **clé d'API** (pas d'un simple login à l'appli de chat).
+`pia` a besoin d'une **clé d'API** (pas d'un simple login à l'appli de chat).
 
 | Fournisseur     | Où obtenir la clé            | Variable d'environnement   |
 |-----------------|------------------------------|----------------------------|
@@ -46,27 +50,45 @@ et te rappelle d'ajouter `~/.local/bin` à ton `PATH`.
 | **Kimi/Moonshot**| https://platform.moonshot.ai | `MOONSHOT_API_KEY`        |
 | **OpenAI**      | https://platform.openai.com  | `OPENAI_API_KEY`           |
 
-Exporte-la (ajoute la ligne à ton `~/.profile` pour la garder) :
+Le plus simple, enregistre-la de façon **permanente** dans la config (fichier en
+permissions `600`, jamais versionné) :
 
 ```sh
-export OPENCODE_ZEN_API_KEY=xxxxxxxx     # ton abonnement OpenCode
-# ou
-export MOONSHOT_API_KEY=xxxxxxxx         # ton abonnement Kimi
+pia -p opencode --set-key TA_CLE      # OpenCode Zen
+pia -p kimi     --set-key TA_CLE      # Kimi/Moonshot
 ```
+
+> Alternative : exporter une variable d'environnement dans `~/.profile`
+> (`export OPENCODE_ZEN_API_KEY=...`). La variable a priorité sur la config.
 
 ### 2. Choisir le fournisseur
 
-Le fournisseur par défaut est défini dans `~/.config/chip-ai/config.json`
-(champ `"provider"`). Tu peux aussi le changer à la volée :
+Le fournisseur par défaut est dans `~/.config/pia/config.json` (champ
+`"provider"`). À la volée :
 
 ```sh
-chip -p opencode          # utilise OpenCode Zen
-chip -p kimi              # utilise Kimi/Moonshot
-chip -p kimi -m kimi-k3   # ... avec un modèle précis
+pia -p opencode          # OpenCode Zen
+pia -p kimi              # Kimi/Moonshot
+pia -p kimi -m kimi-k3   # ... avec un modèle précis
 ```
 
-Le fichier de config permet de définir/renommer des fournisseurs, changer les
-modèles, activer `auto_approve`, etc. Vois `config.example.json`.
+---
+
+## Mise à jour automatique
+
+`pia` est lié à ton clone git local (chemin enregistré par `install.sh`). Au
+lancement du mode interactif, il fait un `git fetch` discret : s'il y a des
+nouveaux commits, il **te propose** de mettre à jour (`git pull` +
+réinstallation du binaire + redémarrage). Ça marche aussi avec un dépôt privé,
+car ça réutilise ton authentification git.
+
+```sh
+pia --update       # vérifier et mettre à jour maintenant, puis quitter
+pia --no-update    # démarrer sans vérifier les mises à jour
+```
+
+Dans le REPL : la commande `/update`. Silencieux si tu es hors-ligne ou déjà à
+jour.
 
 ---
 
@@ -75,14 +97,14 @@ modèles, activer `auto_approve`, etc. Vois `config.example.json`.
 ### Mode interactif (REPL)
 
 ```sh
-chip
+pia
 ```
 
 ```
-chip> lis le fichier chip.py et résume ce qu'il fait
-chip> crée un script hello.sh qui affiche la date
-chip> /yolo        (bascule l'auto-approbation des actions)
-chip> /help
+pia> lis le fichier pia.py et résume ce qu'il fait
+pia> crée un script hello.sh qui affiche la date
+pia> /yolo        (bascule l'auto-approbation des actions)
+pia> /help
 ```
 
 Commandes du REPL :
@@ -95,14 +117,15 @@ Commandes du REPL :
 | `/provider [nom]`   | affiche / change le fournisseur                  |
 | `/yolo`             | bascule l'auto-approbation (write/edit/run)      |
 | `/cwd [dossier]`    | affiche / change le dossier de travail           |
+| `/update`           | cherche et propose une mise à jour               |
 | `/tools`            | liste les outils                                 |
 | `/exit`, `/quit`    | quitter (Ctrl-D aussi)                           |
 
 ### Mode « une commande »
 
 ```sh
-chip "corrige la faute de frappe dans README.md"
-chip --yolo "lance les tests et dis-moi ce qui casse"
+pia "corrige la faute de frappe dans README.md"
+pia --yolo "lance les tests et dis-moi ce qui casse"
 ```
 
 ### Options en ligne de commande
@@ -113,6 +136,9 @@ chip --yolo "lance les tests et dis-moi ce qui casse"
     --base-url URL      force l'URL de base de l'API
     --no-stream         désactive le streaming
     --yolo              approuve automatiquement toutes les actions
+    --set-key CLE       enregistre la clé API du fournisseur, puis quitte
+    --update            vérifie/installe une mise à jour, puis quitte
+    --no-update         démarre sans vérifier les mises à jour
     --config            affiche le chemin du fichier de config
     --version
 ```
@@ -141,18 +167,19 @@ est pratique une fois que tu as confiance.
 - La sortie des outils renvoyée au modèle est tronquée (~12 ko) pour économiser
   la RAM et le contexte.
 - Tout tient dans un seul fichier : tu peux l'éditer directement sur l'appareil
-  avec `nano chip.py`.
-- Si ta connexion coupe, `chip` affiche une erreur claire et te rend la main —
+  avec `nano pia.py`.
+- Si ta connexion coupe, `pia` affiche une erreur claire et te rend la main —
   aucun état corrompu.
 
 ---
 
 ## Dépannage
 
-- **« no API key found »** → exporte la variable d'environnement du fournisseur
-  choisi (voir tableau plus haut).
+- **« pas de clé API trouvée »** → `pia -p <fournisseur> --set-key TA_CLE`.
 - **HTTP 401 / 403** → clé invalide ou expirée, ou crédits épuisés.
 - **HTTP 404 sur le modèle** → le nom de modèle n'existe pas chez ce
   fournisseur ; ajuste avec `-m` ou dans la config.
 - **`SyntaxError`** → ton Python est trop ancien (< 3.6). Vérifie
   `python3 --version`.
+- **L'auto-update ne trouve rien** → vérifie `repo_dir` dans
+  `~/.config/pia/config.json` (doit pointer vers ton clone git).
