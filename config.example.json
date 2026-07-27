@@ -29,6 +29,7 @@
   "max_history_messages": 40,
   "context_limit": null,
   "auto_compact": false,
+  "bash_timeout": 300,
   "update": {
     "enabled": true,
     "repo_dir": "",

@@ -295,7 +295,11 @@ Commandes du REPL :
 |------------------|----------------------------------------------------------|
 | `!commande`      | lance une commande shell directement — **aucun token consommé** ; la sortie est ajoutée au contexte |
 | `@chemin/fichier`| joint le contenu du fichier à ton message                 |
+| **`Tab`**        | complète les commandes `/…` et les chemins après `@`      |
 | `\` en fin de ligne | continue la saisie sur la ligne suivante              |
+
+La complétion ne se déclenche que sur `/` en début de ligne et sur `@` : le
+texte courant n'est jamais complété, pour ne pas te gêner quand tu écris.
 
 Exemples :
 
@@ -362,6 +366,15 @@ pia --continue     # ou : pia -c
 | `write_file`   | créer / écraser un fichier                  | **oui**      |
 | `str_replace`  | remplacer un passage unique dans un fichier | **oui**      |
 | `run_bash`     | exécuter une commande shell                 | **oui**      |
+
+`run_bash` affiche la sortie **au fur et à mesure** (indispensable quand une
+compilation prend deux minutes sur un cœur ARM), tue tout l'arbre de
+processus au bout de `bash_timeout` (300 s par défaut, réglable), et se coupe
+proprement au Ctrl-C sans quitter `pia`.
+
+Les fichiers sont lus par tranches plafonnées et `str_replace` refuse les
+fichiers de plus de 2 Mo : sur 512 Mo de RAM, charger un gros fichier en
+entier ferait tomber la machine.
 
 Les actions qui modifient l'état :
 - affichent un **aperçu diff** (coloré, limité à ~40 lignes) avant de demander confirmation,

@@ -16,19 +16,22 @@ Requires Python 3.6+ (uses f-strings). Check with:  python3 --version
 import argparse
 import difflib
 import fnmatch
+import glob
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -99,6 +102,8 @@ DEFAULT_CONFIG = {
     # to a conservative default. Set it if you know the real figure.
     "context_limit": None,
     "auto_compact": False,  # summarise automatically instead of just warning
+    # generous by default: builds and installs are slow on a 1 GHz ARM core
+    "bash_timeout": 300,
     "update": {
         # repo_dir is filled in by install.sh (path of your local git clone).
         "enabled": True,
@@ -573,14 +578,24 @@ def undo_last_edit():
     return "rien à annuler."
 
 
+# Whole files are held in RAM here, and this machine only has 512 MB.
+MAX_FILE_BYTES = 2_000_000
+
+
 def tool_read_file(args):
     path = args["path"]
     try:
+        size = os.path.getsize(path)
         with open(path, "r", errors="replace") as f:
-            data = f.read()
+            # only ever pull in what we would send anyway: loading a 2 MB file
+            # just to trim it to 12 kB would waste this machine's RAM
+            data = f.read(MAX_TOOL_OUTPUT + 1)
     except Exception as e:
         return f"ERROR reading {path}: {e}"
-    return _truncate(data)
+    if len(data) > MAX_TOOL_OUTPUT:
+        data = data[:MAX_TOOL_OUTPUT]
+        data += f"\n... [tronque ; le fichier fait {size} octets]"
+    return data
 
 
 def tool_write_file(args):
@@ -603,6 +618,12 @@ def tool_str_replace(args):
     old = args["old"]
     new = args.get("new", "")
     try:
+        # this rewrites the whole file, so refuse rather than blow up the RAM
+        if os.path.getsize(path) > MAX_FILE_BYTES:
+            return (
+                f"ERROR: {path} depasse {MAX_FILE_BYTES} octets ; "
+                "trop gros pour une edition en memoire sur cette machine"
+            )
         with open(path, "r", errors="replace") as f:
             data = f.read()
     except Exception as e:
@@ -693,22 +714,91 @@ def tool_grep_search(args):
     return _truncate("\n".join(results) or "(no matches)")
 
 
-def tool_run_bash(args, timeout=90):
+# Settings that tools need but that are not passed through the tool schema.
+# Populated from the config at the start of every turn.
+RUNTIME = {"bash_timeout": 300}
+
+MAX_ECHO_LINES = 200  # printed live; the model still receives the full capture
+
+
+def tool_run_bash(args):
+    """Run a shell command, streaming its output as it appears.
+
+    Two things matter on a 1 GHz single-core board: you must SEE that a slow
+    command is progressing, and it must not be killed just for being slow.
+    Output is echoed line by line, and the timeout is generous and
+    configurable ("bash_timeout"). Ctrl-C kills the command, not pia.
+    """
     cmd = args["command"]
+    timeout = int(RUNTIME.get("bash_timeout", 300))
+    width = term_width()
+    captured = []
+    echoed = 0
+
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
+            bufsize=1,
+            universal_newlines=True,
+            errors="replace",
+            # own process group: killing the shell alone leaves its children
+            # holding the pipe open, and we would block reading it forever
+            start_new_session=True,
         )
-        out = proc.stdout.decode("utf-8", errors="replace")
-        return _truncate(f"[exit {proc.returncode}]\n{out}")
-    except subprocess.TimeoutExpired:
-        return f"ERROR: command timed out after {timeout}s"
     except Exception as e:
         return f"ERROR running command: {e}"
+
+    def _kill_tree():
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    # a watchdog, so a command that hangs without printing anything still dies
+    killed = {"by_timeout": False}
+
+    def _kill():
+        killed["by_timeout"] = True
+        _kill_tree()
+
+    watchdog = threading.Timer(timeout, _kill)
+    watchdog.start()
+    try:
+        for line in proc.stdout:
+            captured.append(line)
+            if echoed < MAX_ECHO_LINES:
+                eprint(dim("  | " + line.rstrip("\n")[: width - 4]))
+                echoed += 1
+            elif echoed == MAX_ECHO_LINES:
+                eprint(dim("  | ... (suite masquee a l'ecran)"))
+                echoed += 1
+        proc.wait()
+    except KeyboardInterrupt:
+        _kill_tree()
+        eprint(dim("  (commande interrompue)"))
+        captured.append("\n[interrompu par l'utilisateur]")
+    except Exception as e:
+        captured.append(f"\n[erreur de lecture: {e}]")
+    finally:
+        watchdog.cancel()
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+
+    out = "".join(captured)
+    if killed["by_timeout"]:
+        return _truncate(
+            f"ERROR: commande tuee apres {timeout}s "
+            f'(augmente "bash_timeout" dans la config)\n{out}'
+        )
+    return _truncate(f"[exit {proc.returncode}]\n{out}")
 
 
 # name -> (function, needs_confirmation, description-for-user)
@@ -1364,6 +1454,7 @@ def agent_turn(cfg, provider, messages):
     usage_total = cfg.setdefault("_usage", {"prompt": 0, "completion": 0, "total": 0})
     limit, _src = context_limit(cfg, provider)
     budget = int(limit * COMPACT_THRESHOLD)
+    RUNTIME["bash_timeout"] = int(cfg.get("bash_timeout", 300))
 
     dropped = trim_history(messages, max_history, token_budget=budget)
     if dropped:
@@ -1833,6 +1924,66 @@ def print_banner(provider, cfg):
     print(dim("/help pour l'aide, Ctrl-D pour quitter"))
 
 
+# ---------------------------------------------------------------------------
+# Tab completion — every keystroke saved matters on the CHIP's little keyboard
+# ---------------------------------------------------------------------------
+BUILTIN_COMMANDS = [
+    "/help", "/reset", "/model", "/provider", "/models", "/yolo", "/cwd",
+    "/update", "/save", "/load", "/sessions", "/usage", "/context", "/env",
+    "/compact", "/undo", "/diff", "/commit", "/init", "/commands", "/tools",
+    "/exit", "/quit",
+]
+
+
+def _path_options(prefix):
+    """Filesystem completions, with a trailing / on directories."""
+    out = []
+    try:
+        for m in glob.glob(os.path.expanduser(prefix) + "*"):
+            out.append(m + "/" if os.path.isdir(m) else m)
+    except Exception:
+        return []
+    return sorted(out)
+
+
+def make_completer(commands):
+    """Complete /commands at the start of a line, and @paths anywhere.
+
+    Bare words are deliberately left alone: completing ordinary prose against
+    the filesystem would fight the user on every sentence.
+    """
+    def completer(text, state):
+        try:
+            if text.startswith("@"):
+                opts = ["@" + p for p in _path_options(text[1:])]
+            elif text.startswith("/"):
+                if readline.get_begidx() == 0:
+                    opts = sorted(c for c in commands if c.startswith(text))
+                else:
+                    opts = _path_options(text)  # an absolute path mid-sentence
+            else:
+                return None
+            return opts[state] if state < len(opts) else None
+        except Exception:
+            return None
+
+    return completer
+
+
+def setup_completion(custom_commands):
+    """Install the completer. Silently does nothing without readline."""
+    try:
+        import readline as _rl
+        globals()["readline"] = _rl
+        names = BUILTIN_COMMANDS + ["/" + c for c in custom_commands]
+        _rl.set_completer(make_completer(names))
+        # keep "@path/to/file" as a single token so it completes as a whole
+        _rl.set_completer_delims(" \t\n")
+        _rl.parse_and_bind("tab: complete")
+    except Exception:
+        pass
+
+
 def _read_input(prompt):
     """Read one logical line, supporting a trailing backslash to keep typing
     on the next line (handy for pasting short multi-line snippets)."""
@@ -1851,6 +2002,7 @@ def repl(cfg, provider, check_update=True, resume=False):
         import readline  # noqa: F401  (enables line editing/history if available)
     except Exception:
         pass
+    setup_completion(load_custom_commands())
 
     # propose an update before starting the session (silent if none / offline)
     if check_update:
