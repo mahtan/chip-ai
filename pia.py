@@ -14,8 +14,11 @@ Requires Python 3.6+ (uses f-strings). Check with:  python3 --version
 """
 
 import argparse
+import difflib
+import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,7 +27,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -90,6 +93,7 @@ DEFAULT_CONFIG = {
     "stream": True,
     "max_steps": 25,
     "request_timeout": 180,
+    "max_history_messages": 40,  # trim oldest turns beyond this to bound RAM/context
     "update": {
         # repo_dir is filled in by install.sh (path of your local git clone).
         "enabled": True,
@@ -160,6 +164,61 @@ def save_key(provider_name, key):
     except Exception:
         pass
     return path
+
+
+# ---------------------------------------------------------------------------
+# Session persistence (survives crashes, SSH drops, low battery shutdowns...)
+# ---------------------------------------------------------------------------
+def sessions_dir():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    d = os.path.join(base, APP_NAME, "sessions")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def save_session(messages, name="last"):
+    path = os.path.join(sessions_dir(), name + ".json")
+    with open(path, "w") as f:
+        json.dump(messages, f, ensure_ascii=False)
+    return path
+
+
+def load_session(name="last"):
+    path = os.path.join(sessions_dir(), name + ".json")
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def list_sessions():
+    d = sessions_dir()
+    return sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json"))
+
+
+# ---------------------------------------------------------------------------
+# Battery (Pocket C.H.I.P specific touch; silently absent on other machines)
+# ---------------------------------------------------------------------------
+def battery_status():
+    base = "/sys/class/power_supply"
+    try:
+        names = os.listdir(base)
+    except Exception:
+        return None
+    for name in names:
+        cap_path = os.path.join(base, name, "capacity")
+        if not os.path.exists(cap_path):
+            continue
+        try:
+            with open(cap_path) as f:
+                cap = f.read().strip()
+            status = ""
+            status_path = os.path.join(base, name, "status")
+            if os.path.exists(status_path):
+                with open(status_path) as f:
+                    status = f.read().strip().lower()
+            return cap, status
+        except Exception:
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +298,7 @@ def offer_update(cfg, restart_argv=None):
     n, repo_dir, branch = info
     plural = "s" if n > 1 else ""
     print(yellow(f"{n} mise{plural} à jour disponible{plural} sur « {branch} »."))
-    if not confirm("Mettre à jour maintenant ?"):
+    if not cfg.get("auto_approve") and confirm_action("Mettre à jour maintenant ?") == "n":
         return False
     ok, msg = apply_update(repo_dir)
     if not ok:
@@ -352,6 +411,50 @@ def _truncate(s, limit=MAX_TOOL_OUTPUT):
     return head + f"\n... [truncated, {len(s) - len(head)} more chars]"
 
 
+MAX_DIFF_LINES = 40  # keep previews short enough for a 480x272 screen
+
+
+def make_diff(old, new, path):
+    """Return a small colored unified diff string, or None if old == new."""
+    diff = list(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=path,
+            tofile=path,
+            lineterm="",
+        )
+    )
+    if not diff:
+        return None
+    shown = diff[:MAX_DIFF_LINES]
+    out = []
+    for line in shown:
+        line = line.rstrip("\n")
+        if line.startswith("+++") or line.startswith("---"):
+            out.append(dim(line))
+        elif line.startswith("+"):
+            out.append(green(line))
+        elif line.startswith("-"):
+            out.append(red(line))
+        elif line.startswith("@@"):
+            out.append(cyan(line))
+        else:
+            out.append(dim(line))
+    if len(diff) > MAX_DIFF_LINES:
+        out.append(dim(f"... ({len(diff) - MAX_DIFF_LINES} more lines)"))
+    return "\n".join(out)
+
+
+def _backup(path):
+    """Keep a single-level .bak copy before overwriting an existing file."""
+    try:
+        if os.path.isfile(path):
+            shutil.copyfile(path, path + ".pia.bak")
+    except Exception:
+        pass
+
+
 def tool_read_file(args):
     path = args["path"]
     try:
@@ -367,6 +470,7 @@ def tool_write_file(args):
     content = args.get("content", "")
     d = os.path.dirname(os.path.abspath(path))
     try:
+        _backup(path)
         if d and not os.path.isdir(d):
             os.makedirs(d)
         with open(path, "w") as f:
@@ -392,6 +496,7 @@ def tool_str_replace(args):
         return f"ERROR: pattern is not unique ({n} matches) in {path}; add more context"
     data = data.replace(old, new, 1)
     try:
+        _backup(path)
         with open(path, "w") as f:
             f.write(data)
     except Exception as e:
@@ -411,6 +516,63 @@ def tool_list_dir(args):
         marker = "/" if os.path.isdir(full) else ""
         lines.append(name + marker)
     return _truncate("\n".join(lines) or "(empty)")
+
+
+SEARCH_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".cache"}
+MAX_SEARCH_MATCHES = 200
+MAX_SEARCH_FILE_SIZE = 2_000_000  # skip huge files to protect 512 MB of RAM
+
+
+def tool_glob_search(args):
+    pattern = args["pattern"]
+    root = args.get("path", ".")
+    matches = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SEARCH_SKIP_DIRS]
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root)
+            if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
+                matches.append(rel)
+                if len(matches) >= MAX_SEARCH_MATCHES:
+                    break
+        if len(matches) >= MAX_SEARCH_MATCHES:
+            break
+    return _truncate("\n".join(sorted(matches)) or "(no matches)")
+
+
+def tool_grep_search(args):
+    pattern = args["pattern"]
+    root = args.get("path", ".")
+    file_glob = args.get("glob")
+    try:
+        rx = re.compile(pattern)
+    except Exception as e:
+        return f"ERROR: invalid regex: {e}"
+    results = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SEARCH_SKIP_DIRS]
+        for name in filenames:
+            if file_glob and not fnmatch.fnmatch(name, file_glob):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(full) > MAX_SEARCH_FILE_SIZE:
+                    continue
+                with open(full, "r", errors="ignore") as f:
+                    for i, line in enumerate(f, 1):
+                        if rx.search(line):
+                            rel = os.path.relpath(full, root)
+                            results.append(f"{rel}:{i}: {line.strip()}")
+                            if len(results) >= MAX_SEARCH_MATCHES:
+                                break
+            except Exception:
+                continue
+            if len(results) >= MAX_SEARCH_MATCHES:
+                break
+        if len(results) >= MAX_SEARCH_MATCHES:
+            break
+    return _truncate("\n".join(results) or "(no matches)")
 
 
 def tool_run_bash(args, timeout=90):
@@ -437,6 +599,8 @@ TOOLS = {
     "write_file": (tool_write_file, True, "write"),
     "str_replace": (tool_str_replace, True, "edit"),
     "list_dir": (tool_list_dir, False, "list"),
+    "glob_search": (tool_glob_search, False, "find"),
+    "grep_search": (tool_grep_search, False, "grep"),
     "run_bash": (tool_run_bash, True, "run"),
 }
 
@@ -502,6 +666,43 @@ TOOL_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "glob_search",
+            "description": "Find files by name pattern (e.g. '*.py', 'src/**/*.ts').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_search",
+            "description": (
+                "Search file contents with a regular expression across a "
+                "directory tree. Returns 'path:line: text' per match."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                    "glob": {
+                        "type": "string",
+                        "description": "only search files matching this name pattern, e.g. '*.py'",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_bash",
             "description": (
                 "Run a shell command in the current working directory and return "
@@ -520,10 +721,12 @@ SYSTEM_PROMPT = (
     "You are pia, a concise AI coding assistant running in a terminal on a small "
     "ARM computer (a Pocket C.H.I.P). Keep answers short and to the point; the "
     "screen is tiny. You can inspect and modify the local project using the "
-    "provided tools: read_file, write_file, str_replace, list_dir, run_bash. "
-    "Prefer str_replace for small edits and write_file for new files. Before "
-    "editing a file, read it. Explain what you did in one or two sentences. Do not "
-    "invent file contents — read them first."
+    "provided tools: read_file, write_file, str_replace, list_dir, glob_search, "
+    "grep_search, run_bash. Prefer str_replace for small edits and write_file "
+    "for new files. Use glob_search to find files by name and grep_search to "
+    "find text/code across the project instead of shelling out to find/grep. "
+    "Before editing a file, read it. Explain what you did in one or two "
+    "sentences. Do not invent file contents — read them first."
 )
 
 
@@ -537,6 +740,10 @@ def http_chat(provider, messages, tools, stream, timeout):
         "messages": messages,
         "stream": bool(stream),
     }
+    if stream:
+        # ask OpenAI-compatible servers to send a final usage chunk; servers
+        # that don't support it simply ignore the field.
+        payload["stream_options"] = {"include_usage": True}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -584,12 +791,14 @@ def _read_full(resp):
                 "arguments": tc["function"].get("arguments", "") or "",
             }
         )
-    return content, tool_calls
+    usage = obj.get("usage") or {}
+    return content, tool_calls, usage
 
 
 def _read_stream(resp):
     content_parts = []
     slots = {}  # index -> {id, name, arguments}
+    usage = {}
     printed_any = False
     for raw in resp:
         line = raw.decode("utf-8", errors="replace").strip()
@@ -602,6 +811,8 @@ def _read_stream(resp):
             obj = json.loads(data)
         except Exception:
             continue
+        if obj.get("usage"):
+            usage = obj["usage"]
         choices = obj.get("choices") or []
         if not choices:
             continue
@@ -627,21 +838,62 @@ def _read_stream(resp):
         sys.stdout.flush()
     content = "".join(content_parts)
     tool_calls = [slots[i] for i in sorted(slots)]
-    return content, tool_calls
+    return content, tool_calls, usage
 
 
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
-def confirm(prompt):
+def confirm_action(prompt):
+    """Ask y/N/a. Returns 'y', 'n', or 'a' (always-approve this tool type).
+
+    stdin may be non-interactive (piped, redirected, cron, ...) — e.g. when
+    one-shot mode also reads stdin for context. There is then no way to ask,
+    so fail closed and say why, instead of silently hanging or declining.
+    """
+    if not sys.stdin.isatty():
+        eprint(red("    non-interactif : action refusée (utilise --yolo)"))
+        return "n"
     try:
-        ans = input(yellow(prompt + " [y/N] ")).strip().lower()
+        ans = input(yellow(prompt + " [y/N/a] ")).strip().lower()
     except EOFError:
-        return False
-    return ans in ("y", "yes", "o", "oui")
+        return "n"
+    if ans in ("a", "always", "toujours"):
+        return "a"
+    if ans in ("y", "yes", "o", "oui"):
+        return "y"
+    return "n"
 
 
-def run_tool(name, arguments_str, auto_approve):
+def _preview_diff(name, args):
+    """Show a small diff for write_file/str_replace before asking to confirm."""
+    path = args.get("path")
+    if not path:
+        return
+    try:
+        old = ""
+        if os.path.isfile(path):
+            with open(path, "r", errors="replace") as f:
+                old = f.read()
+        if name == "write_file":
+            new = args.get("content", "")
+        elif name == "str_replace":
+            old_pat, new_pat = args.get("old", ""), args.get("new", "")
+            if old_pat not in old:
+                return  # tool_str_replace will report the real error
+            new = old.replace(old_pat, new_pat, 1)
+        else:
+            return
+        diff = make_diff(old, new, path)
+        if diff:
+            eprint(diff)
+        else:
+            eprint(dim("    (no changes)"))
+    except Exception:
+        pass  # preview is best-effort; never block the actual tool call
+
+
+def run_tool(name, arguments_str, cfg):
     if name not in TOOLS:
         return f"ERROR: unknown tool '{name}'"
     try:
@@ -650,30 +902,69 @@ def run_tool(name, arguments_str, auto_approve):
         return f"ERROR: could not parse arguments: {e}"
 
     fn, needs_confirm, verb = TOOLS[name]
+    auto_approve = bool(cfg.get("auto_approve", False))
+    always = cfg.setdefault("_always_approve", set())
 
     # show what is about to happen
     target = args.get("path") or args.get("command") or ""
     eprint(dim(f"  → {verb} {target}"[: term_width() - 1]))
 
-    if needs_confirm and not auto_approve:
-        if not confirm(f"    allow {name}?"):
+    if needs_confirm and not auto_approve and name not in always:
+        if name in ("write_file", "str_replace"):
+            _preview_diff(name, args)
+        ans = confirm_action(f"    allow {name}?")
+        if ans == "n":
             return "User declined this action."
+        if ans == "a":
+            always.add(name)
     return fn(args)
+
+
+def trim_history(messages, max_messages):
+    """Drop the oldest whole turns once history grows past max_messages.
+
+    A "turn" starts at a user message, so tool_call/tool-result pairs are
+    never split apart. Keeps RAM and API context bounded on long sessions.
+    """
+    if max_messages <= 0:
+        return
+    system = messages[:1] if messages and messages[0].get("role") == "system" else []
+    rest = messages[len(system):]
+    while len(rest) > max_messages and rest:
+        rest.pop(0)
+        while rest and rest[0].get("role") != "user":
+            rest.pop(0)
+    messages[:] = system + rest
 
 
 def agent_turn(cfg, provider, messages):
     max_steps = int(cfg.get("max_steps", 25))
     stream = bool(cfg.get("stream", True))
     timeout = int(cfg.get("request_timeout", 180))
-    auto = bool(cfg.get("auto_approve", False))
+    max_history = int(cfg.get("max_history_messages", 40))
+    usage_total = cfg.setdefault("_usage", {"prompt": 0, "completion": 0, "total": 0})
+
+    trim_history(messages, max_history)
 
     for _ in range(max_steps):
-        content, tool_calls = http_chat(
+        content, tool_calls, usage = http_chat(
             provider, messages, TOOL_SCHEMA, stream, timeout
         )
+        if usage:
+            usage_total["prompt"] += usage.get("prompt_tokens", 0) or 0
+            usage_total["completion"] += usage.get("completion_tokens", 0) or 0
+            usage_total["total"] += usage.get("total_tokens", 0) or 0
 
         if not tool_calls:
             messages.append({"role": "assistant", "content": content})
+            if usage:
+                eprint(
+                    dim(
+                        f"  [{usage.get('prompt_tokens', 0)}+"
+                        f"{usage.get('completion_tokens', 0)} tok this turn, "
+                        f"{usage_total['total']} total this session]"
+                    )
+                )
             return
 
         # record the assistant's tool-call turn
@@ -696,7 +987,7 @@ def agent_turn(cfg, provider, messages):
         )
 
         for tc in tool_calls:
-            result = run_tool(tc["name"], tc["arguments"], auto)
+            result = run_tool(tc["name"], tc["arguments"], cfg)
             messages.append(
                 {
                     "role": "tool",
@@ -719,8 +1010,13 @@ commands:
   /yolo            toggle auto-approve for write/edit/run
   /cwd [dir]       show or change working directory
   /update          check the git repo for updates and offer to install
+  /save [name]     save the conversation (default: "manual")
+  /load [name]     load a saved conversation (default: "manual")
+  /sessions        list saved conversations
+  /usage           show tokens used this session
   /tools           list available tools
   /exit, /quit     leave (Ctrl-D also works)
+Tip: end a line with \\ to keep typing on the next line.
 Type anything else to talk to the model."""
 
 
@@ -733,10 +1029,33 @@ def print_banner(provider, cfg):
             f"({key_state})  auto_approve={cfg.get('auto_approve')}"
         )
     )
+    try:
+        batt = battery_status()
+    except Exception:
+        batt = None
+    if batt:
+        cap, status = batt
+        label = f"batt={cap}%"
+        if status:
+            label += f" ({status})"
+        print(dim(label))
     print(dim("type /help for commands, Ctrl-D to quit"))
 
 
-def repl(cfg, provider, check_update=True):
+def _read_input(prompt):
+    """Read one logical line, supporting a trailing backslash to keep typing
+    on the next line (handy for pasting short multi-line snippets)."""
+    line = input(prompt)
+    while line.endswith("\\"):
+        line = line[:-1] + "\n"
+        try:
+            line += input(dim("... "))
+        except EOFError:
+            break
+    return line
+
+
+def repl(cfg, provider, check_update=True, resume=False):
     try:
         import readline  # noqa: F401  (enables line editing/history if available)
     except Exception:
@@ -750,11 +1069,20 @@ def repl(cfg, provider, check_update=True):
             pass
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if resume:
+        try:
+            loaded = load_session("last")
+            if loaded:
+                messages = loaded
+                print(dim(f"session reprise ({len(messages)} messages)."))
+        except Exception:
+            pass
+
     print_banner(provider, cfg)
 
     while True:
         try:
-            line = input(bold(green(f"\n{APP_NAME}> ")))
+            line = _read_input(bold(green(f"\n{APP_NAME}> ")))
         except EOFError:
             print()
             break
@@ -800,6 +1128,33 @@ def repl(cfg, provider, check_update=True):
             elif cmd == "/update":
                 if not offer_update(cfg, restart_argv=[a for a in sys.argv[1:]]):
                     print(dim("déjà à jour (ou vérification impossible)."))
+            elif cmd == "/save":
+                try:
+                    path = save_session(messages, arg or "manual")
+                    print(dim(f"session sauvegardée : {path}"))
+                except Exception as e:
+                    eprint(red(str(e)))
+            elif cmd == "/load":
+                try:
+                    messages = load_session(arg or "manual")
+                    print(dim(f"session chargée ({len(messages)} messages)."))
+                except Exception as e:
+                    eprint(red(str(e)))
+            elif cmd == "/sessions":
+                names = list_sessions()
+                if names:
+                    for n in names:
+                        print(dim("  " + n))
+                else:
+                    print(dim("(aucune session sauvegardée)"))
+            elif cmd == "/usage":
+                u = cfg.get("_usage", {"prompt": 0, "completion": 0, "total": 0})
+                print(
+                    dim(
+                        f"prompt={u['prompt']} completion={u['completion']} "
+                        f"total={u['total']} tokens"
+                    )
+                )
             elif cmd == "/tools":
                 for name in TOOLS:
                     print(dim("  " + name))
@@ -814,6 +1169,10 @@ def repl(cfg, provider, check_update=True):
             eprint(red(str(e)))
         except KeyboardInterrupt:
             eprint(dim("\n(interrupted)"))
+        try:
+            save_session(messages, "last")  # auto-save: survives crashes / low battery
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +1212,13 @@ def main(argv=None):
     parser.add_argument(
         "--no-update", action="store_true", help="skip the startup update check"
     )
+    parser.add_argument(
+        "-c",
+        "--continue",
+        dest="cont",
+        action="store_true",
+        help="resume the last interactive session",
+    )
     parser.add_argument("--version", action="store_true")
     args = parser.parse_args(argv)
 
@@ -871,14 +1237,15 @@ def main(argv=None):
         print(green(f"clé enregistrée pour '{prov_name}' dans {path}"))
         return
 
-    if args.update:
-        if not offer_update(cfg):
-            print(dim("déjà à jour (ou vérification impossible)."))
-        return
     if args.no_stream:
         cfg["stream"] = False
     if args.yolo:
         cfg["auto_approve"] = True
+
+    if args.update:
+        if not offer_update(cfg):
+            print(dim("déjà à jour (ou vérification impossible)."))
+        return
 
     provider = resolve_provider(cfg, args.provider)
     if args.model:
@@ -897,9 +1264,25 @@ def main(argv=None):
         )
 
     if args.prompt:
-        one_shot(cfg, provider, " ".join(args.prompt))
+        prompt_text = " ".join(args.prompt)
+        if not sys.stdin.isatty():
+            try:
+                piped = sys.stdin.read(50_000)  # capped: keep RAM/context small
+            except Exception:
+                piped = ""
+            if piped.strip():
+                prompt_text += "\n\n--- stdin ---\n" + piped
+                if not cfg.get("auto_approve"):
+                    eprint(
+                        yellow(
+                            "note : stdin non interactif (utilisé comme contexte) — "
+                            "les actions nécessitant confirmation seront refusées ; "
+                            "ajoute --yolo si le prompt doit écrire/modifier/exécuter."
+                        )
+                    )
+        one_shot(cfg, provider, prompt_text)
     else:
-        repl(cfg, provider, check_update=not args.no_update)
+        repl(cfg, provider, check_update=not args.no_update, resume=args.cont)
 
 
 if __name__ == "__main__":

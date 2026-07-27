@@ -26,6 +26,7 @@
   "stream": true,
   "max_steps": 25,
   "request_timeout": 180,
+  "max_history_messages": 40,
   "update": {
     "enabled": true,
     "repo_dir": "",

@@ -9,10 +9,14 @@ petit écran**. La commande à taper est **`pia`**.
   standard uniquement). Pas de `pip`, pas de `node`, pas de compilation.
 - Compatible avec **n'importe quelle API au format OpenAI** : OpenCode Zen,
   Kimi/Moonshot, OpenAI, ou un serveur local (`llama.cpp`, Ollama…).
-- Agent avec outils : lecture/écriture de fichiers, édition ciblée, `ls`, et
-  exécution de commandes shell — avec confirmation avant toute action qui
-  modifie quelque chose.
+- Agent avec outils : lecture/écriture de fichiers, édition ciblée, recherche
+  (`grep`/`glob`), et exécution de commandes shell.
+- **Aperçu diff + sauvegarde `.bak`** avant toute écriture/édition, avec
+  confirmation `y/N/a` (« a » = ne plus redemander pour cet outil).
+- **Sessions persistantes** : reprise après coupure (`--continue`), sauvegarde
+  manuelle (`/save`), et suivi des tokens consommés (`/usage`).
 - Réponses **streamées** pour la réactivité même sur connexion lente.
+- **Historique tronqué automatiquement** pour ne jamais saturer les 512 Mo de RAM.
 - **Clé API enregistrée une fois pour toutes** et **auto-update** au démarrage.
 
 Requiert **Python 3.6+**. (Debian 11 « bullseye » du Pocket C.H.I.P fournit
@@ -102,6 +106,7 @@ pia
 
 ```
 pia> lis le fichier pia.py et résume ce qu'il fait
+pia> trouve tous les usages de tool_write_file dans le projet
 pia> crée un script hello.sh qui affiche la date
 pia> /yolo        (bascule l'auto-approbation des actions)
 pia> /help
@@ -118,14 +123,41 @@ Commandes du REPL :
 | `/yolo`             | bascule l'auto-approbation (write/edit/run)      |
 | `/cwd [dossier]`    | affiche / change le dossier de travail           |
 | `/update`           | cherche et propose une mise à jour               |
+| `/save [nom]`       | sauvegarde la conversation (défaut : « manual »)  |
+| `/load [nom]`       | recharge une conversation sauvegardée             |
+| `/sessions`         | liste les conversations sauvegardées              |
+| `/usage`            | tokens consommés depuis le début de la session    |
 | `/tools`            | liste les outils                                 |
 | `/exit`, `/quit`    | quitter (Ctrl-D aussi)                           |
+
+Astuce clavier : termine une ligne par `\` pour continuer à écrire sur la
+ligne suivante (pratique pour coller un petit extrait de code).
+
+Quand l'agent te demande une confirmation, réponds `y` (une fois), `n`
+(refuser) ou **`a`** pour ne plus te demander pour cet outil pendant le reste
+de la session — pratique avec le petit clavier du CHIP.
 
 ### Mode « une commande »
 
 ```sh
 pia "corrige la faute de frappe dans README.md"
 pia --yolo "lance les tests et dis-moi ce qui casse"
+cat monfichier.py | pia "explique ce fichier et corrige les bugs"
+```
+
+> Note : quand l'entrée standard n'est pas un vrai terminal (pipe, script,
+> cron…), `pia` ne peut pas demander de confirmation — toute action qui en
+> nécessite une (écrire, éditer, exécuter) est **refusée par défaut**. Ajoute
+> `--yolo` si le prompt doit réellement modifier des fichiers dans ce contexte.
+
+### Reprendre une session interrompue
+
+Utile si la connexion SSH tombe, si la batterie du CHIP se vide, ou si tu
+fermes le terminal par erreur : la conversation est sauvegardée automatiquement
+après chaque tour.
+
+```sh
+pia --continue     # ou : pia -c
 ```
 
 ### Options en ligne de commande
@@ -136,6 +168,7 @@ pia --yolo "lance les tests et dis-moi ce qui casse"
     --base-url URL      force l'URL de base de l'API
     --no-stream         désactive le streaming
     --yolo              approuve automatiquement toutes les actions
+-c, --continue          reprend la dernière session interactive
     --set-key CLE       enregistre la clé API du fournisseur, puis quitte
     --update            vérifie/installe une mise à jour, puis quitte
     --no-update         démarre sans vérifier les mises à jour
@@ -147,29 +180,40 @@ pia --yolo "lance les tests et dis-moi ce qui casse"
 
 ## Les outils de l'agent
 
-| Outil         | Rôle                                        | Confirmation |
-|---------------|---------------------------------------------|--------------|
-| `read_file`   | lire un fichier                             | non          |
-| `list_dir`    | lister un dossier                           | non          |
-| `write_file`  | créer / écraser un fichier                  | **oui**      |
-| `str_replace` | remplacer un passage unique dans un fichier | **oui**      |
-| `run_bash`    | exécuter une commande shell                 | **oui**      |
+| Outil          | Rôle                                        | Confirmation |
+|----------------|---------------------------------------------|--------------|
+| `read_file`    | lire un fichier                             | non          |
+| `list_dir`     | lister un dossier                           | non          |
+| `glob_search`  | trouver des fichiers par motif de nom       | non          |
+| `grep_search`  | chercher du texte/code dans le projet       | non          |
+| `write_file`   | créer / écraser un fichier                  | **oui**      |
+| `str_replace`  | remplacer un passage unique dans un fichier | **oui**      |
+| `run_bash`     | exécuter une commande shell                 | **oui**      |
 
-Les actions qui modifient l'état demandent une confirmation `y/N`, sauf si
-`auto_approve` est actif (config ou `--yolo`). Sur un petit clavier, `--yolo`
-est pratique une fois que tu as confiance.
+Les actions qui modifient l'état :
+- affichent un **aperçu diff** (coloré, limité à ~40 lignes) avant de demander confirmation,
+- créent une **sauvegarde `chemin.pia.bak`** du fichier précédent avant de l'écraser,
+- demandent une confirmation `y/N/a`, sauf si `auto_approve` est actif (config
+  ou `--yolo`), ou si tu as déjà répondu `a` pour cet outil dans la session.
 
 ---
 
 ## Notes pour les petites machines
 
 - La sortie s'adapte à la largeur du terminal (retour à la ligne automatique).
-- La sortie des outils renvoyée au modèle est tronquée (~12 ko) pour économiser
-  la RAM et le contexte.
+- La sortie des outils renvoyée au modèle est tronquée (~12 ko), et les
+  fichiers de plus de 2 Mo sont ignorés par `grep_search`, pour économiser la
+  RAM et le contexte.
+- **L'historique de conversation est tronqué automatiquement** au-delà de
+  `max_history_messages` (40 par défaut, réglable dans la config) : les tours
+  les plus anciens sont supprimés par blocs entiers pour ne jamais couper un
+  appel d'outil de sa réponse.
+- La bannière affiche le **niveau de batterie** du CHIP quand disponible.
 - Tout tient dans un seul fichier : tu peux l'éditer directement sur l'appareil
   avec `nano pia.py`.
 - Si ta connexion coupe, `pia` affiche une erreur claire et te rend la main —
-  aucun état corrompu.
+  aucun état corrompu. La session est sauvegardée automatiquement, reprends
+  avec `pia --continue`.
 
 ---
 
@@ -183,3 +227,5 @@ est pratique une fois que tu as confiance.
   `python3 --version`.
 - **L'auto-update ne trouve rien** → vérifie `repo_dir` dans
   `~/.config/pia/config.json` (doit pointer vers ton clone git).
+- **« non-interactif : action refusée »** → normal si stdin n'est pas un
+  terminal (pipe/script) ; relance avec `--yolo` si l'action est voulue.
