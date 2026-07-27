@@ -15,7 +15,10 @@ petit écran**. La commande à taper est **`pia`**.
   confirmation `y/N/a` (« a » = ne plus redemander pour cet outil).
 - **Sessions persistantes** : reprise après coupure (`--continue`), sauvegarde
   manuelle (`/save`), et suivi des tokens consommés (`/usage`).
-- Réponses **streamées** pour la réactivité même sur connexion lente.
+- Réponses **streamées** pour la réactivité même sur connexion lente, avec
+  **reprise automatique** quand le wifi du CHIP décroche.
+- **Contexte projet** (`PIA.md`), **commandes personnalisées**, mentions
+  `@fichier` et raccourci shell `!` — pour taper le moins possible.
 - **Historique tronqué automatiquement** pour ne jamais saturer les 512 Mo de RAM.
 - **Clé API enregistrée une fois pour toutes** et **auto-update** au démarrage.
 
@@ -35,8 +38,12 @@ sh install.sh
 Le script :
 - copie `pia` dans `~/.local/bin`,
 - crée `~/.config/pia/config.json` (en migrant une éventuelle ancienne config),
+- installe deux commandes personnalisées d'exemple dans `~/.config/pia/commands/`,
 - enregistre le chemin de ce clone git pour l'**auto-update**,
 - supprime l'ancien binaire `chip` s'il traînait.
+
+Relancer `sh install.sh` plus tard **met à jour le programme** sans jamais
+écraser ta config ni tes commandes personnalisées.
 
 > Pas envie d'installer ? `python3 pia.py` marche directement depuis le dossier.
 
@@ -96,6 +103,56 @@ jour.
 
 ---
 
+## Contexte projet (`PIA.md`)
+
+Comme le `CLAUDE.md` de Claude Code ou le `AGENTS.md` d'OpenCode, `pia` cherche
+au démarrage un fichier de contexte dans le dossier courant, puis en remontant
+jusqu'à la racine du dépôt git (il ne sort jamais du projet) :
+
+1. `PIA.md`
+2. `AGENTS.md`
+3. `CLAUDE.md`
+
+Son contenu (limité à 8 ko) est ajouté aux instructions du modèle à chaque
+requête. Sers-t'en pour les règles du projet : comment lancer les tests, les
+conventions de code, ce qu'il ne faut pas toucher…
+
+```markdown
+# Mon projet
+
+- Lancer les tests : `python3 -m pytest`
+- Toujours répondre en français.
+- Ne jamais modifier `legacy/`.
+```
+
+Tu n'en as pas encore ? La commande `/init` demande au modèle d'explorer le
+projet et d'en écrire un pour toi.
+
+---
+
+## Commandes personnalisées
+
+Crée un fichier `.md` dans `~/.config/pia/commands/` : son nom devient une
+commande. `$ARGUMENTS` est remplacé par ce que tu tapes derrière.
+
+`~/.config/pia/commands/revue.md` :
+
+```markdown
+Relis $ARGUMENTS et liste les bugs, du plus grave au moins grave.
+Une ligne par problème.
+```
+
+S'utilise ensuite ainsi :
+
+```
+pia> /revue @pia.py
+```
+
+`install.sh` en installe deux en exemple (`/revue`, `/explique`) sans jamais
+écraser les tiennes. `/commands` liste celles dont tu disposes.
+
+---
+
 ## Utilisation
 
 ### Mode interactif (REPL)
@@ -128,10 +185,30 @@ Commandes du REPL :
 | `/sessions`         | liste les conversations sauvegardées              |
 | `/usage`            | tokens consommés depuis le début de la session    |
 | `/tools`            | liste les outils                                 |
+| `/models`           | liste les modèles proposés par le fournisseur     |
+| `/compact`          | remplace l'historique par un résumé (libère la RAM) |
+| `/undo`             | annule la dernière modification de fichier        |
+| `/diff`             | affiche `git diff`                                |
+| `/commit`           | rédige un message pour le diff **indexé** (`git add`) puis committe |
+| `/init`             | génère un `PIA.md` décrivant le projet            |
+| `/commands`         | liste tes commandes personnalisées                |
 | `/exit`, `/quit`    | quitter (Ctrl-D aussi)                           |
 
-Astuce clavier : termine une ligne par `\` pour continuer à écrire sur la
-ligne suivante (pratique pour coller un petit extrait de code).
+### Raccourcis pour taper moins (petit clavier)
+
+| Raccourci        | Effet                                                    |
+|------------------|----------------------------------------------------------|
+| `!commande`      | lance une commande shell directement — **aucun token consommé** ; la sortie est ajoutée au contexte |
+| `@chemin/fichier`| joint le contenu du fichier à ton message                 |
+| `\` en fin de ligne | continue la saisie sur la ligne suivante              |
+
+Exemples :
+
+```
+pia> !ls -la
+pia> corrige le bug dans @pia.py
+pia> /revue @tools.py
+```
 
 Quand l'agent te demande une confirmation, réponds `y` (une fois), `n`
 (refuser) ou **`a`** pour ne plus te demander pour cet outil pendant le reste
@@ -168,6 +245,7 @@ pia --continue     # ou : pia -c
     --base-url URL      force l'URL de base de l'API
     --no-stream         désactive le streaming
     --yolo              approuve automatiquement toutes les actions
+                        (nécessaire aussi pour --update non interactif)
 -c, --continue          reprend la dernière session interactive
     --set-key CLE       enregistre la clé API du fournisseur, puis quitte
     --update            vérifie/installe une mise à jour, puis quitte
@@ -196,6 +274,9 @@ Les actions qui modifient l'état :
 - demandent une confirmation `y/N/a`, sauf si `auto_approve` est actif (config
   ou `--yolo`), ou si tu as déjà répondu `a` pour cet outil dans la session.
 
+Tu peux revenir en arrière avec **`/undo`** : il restaure le dernier fichier
+modifié depuis sa sauvegarde, ou supprime le fichier si `pia` venait de le créer.
+
 ---
 
 ## Notes pour les petites machines
@@ -207,13 +288,35 @@ Les actions qui modifient l'état :
 - **L'historique de conversation est tronqué automatiquement** au-delà de
   `max_history_messages` (40 par défaut, réglable dans la config) : les tours
   les plus anciens sont supprimés par blocs entiers pour ne jamais couper un
-  appel d'outil de sa réponse.
+  appel d'outil de sa réponse. `/compact` fait le ménage plus agressivement en
+  remplaçant tout l'historique par un résumé.
+- **Reprise réseau automatique** : une coupure wifi, un timeout ou une réponse
+  429/5xx sont réessayés jusqu'à 4 fois (1s, 2s, 4s). Une clé invalide (401/403)
+  échoue immédiatement, sans réessai inutile.
+- `!commande` évite un aller-retour avec le modèle : **zéro token, zéro
+  attente réseau** — idéal quand la batterie ou le forfait sont comptés.
 - La bannière affiche le **niveau de batterie** du CHIP quand disponible.
 - Tout tient dans un seul fichier : tu peux l'éditer directement sur l'appareil
   avec `nano pia.py`.
-- Si ta connexion coupe, `pia` affiche une erreur claire et te rend la main —
-  aucun état corrompu. La session est sauvegardée automatiquement, reprends
-  avec `pia --continue`.
+- Si ta connexion coupe pour de bon, `pia` affiche une erreur claire et te rend
+  la main — aucun état corrompu. La session est sauvegardée automatiquement,
+  reprends avec `pia --continue`.
+
+---
+
+## Aide-mémoire
+
+| Je veux…                                   | Je tape                          |
+|--------------------------------------------|----------------------------------|
+| démarrer                                    | `pia`                            |
+| reprendre après une coupure                 | `pia -c`                         |
+| poser une question sur un fichier           | `pia> explique @fichier.py`      |
+| lancer une commande sans consommer de token | `pia> !make test`                |
+| annuler une modification                    | `pia> /undo`                     |
+| committer proprement                        | `pia> /commit`                   |
+| libérer de la RAM en pleine session         | `pia> /compact`                  |
+| voir les modèles disponibles                | `pia> /models`                   |
+| documenter le projet pour l'agent           | `pia> /init`                     |
 
 ---
 
@@ -229,3 +332,21 @@ Les actions qui modifient l'état :
   `~/.config/pia/config.json` (doit pointer vers ton clone git).
 - **« non-interactif : action refusée »** → normal si stdin n'est pas un
   terminal (pipe/script) ; relance avec `--yolo` si l'action est voulue.
+- **Ça réessaie en boucle** → le serveur répond 429/5xx ou le wifi lâche ;
+  `pia` retente 4 fois puis abandonne avec un message. Vérifie la connexion
+  du CHIP (`ping 1.1.1.1`) ou tes crédits chez le fournisseur.
+- **`/models` renvoie une erreur** → tous les fournisseurs n'exposent pas
+  `/v1/models` ; règle le modèle à la main avec `-m` ou dans la config.
+- **Mon `PIA.md` est ignoré** → il doit être dans le dossier courant ou un
+  dossier parent **à l'intérieur** du dépôt git. Vérifie avec `/cwd`, et
+  relance `/reset` après l'avoir créé.
+
+---
+
+## Ce que `pia` ne fait pas
+
+Par choix, pour rester léger sur cette machine : pas d'interface graphique,
+pas de coloration syntaxique, pas de MCP, pas de sous-agents, pas d'images.
+Si tu as besoin de tout ça, utilise Claude Code ou OpenCode sur une machine
+plus puissante — `pia` vise le cas « je suis sur mon Pocket C.H.I.P et je veux
+coder ».

@@ -23,11 +23,12 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -446,13 +447,41 @@ def make_diff(old, new, path):
     return "\n".join(out)
 
 
+# files modified this session, most recent last: [(path, backup_or_None), ...]
+EDIT_LOG = []
+
+
 def _backup(path):
-    """Keep a single-level .bak copy before overwriting an existing file."""
+    """Keep a single-level .bak copy before overwriting, and log it for /undo."""
+    bak = None
     try:
         if os.path.isfile(path):
-            shutil.copyfile(path, path + ".pia.bak")
+            bak = path + ".pia.bak"
+            shutil.copyfile(path, bak)
     except Exception:
-        pass
+        bak = None
+    EDIT_LOG.append((path, bak))
+
+
+def undo_last_edit():
+    """Restore the most recent file this session modified. Returns a message."""
+    while EDIT_LOG:
+        path, bak = EDIT_LOG.pop()
+        if bak and os.path.isfile(bak):
+            try:
+                shutil.copyfile(bak, path)
+                os.remove(bak)
+                return f"restauré : {path}"
+            except Exception as e:
+                return f"ERREUR restauration {path}: {e}"
+        # the file was newly created (no backup) -> removing it is the undo
+        if bak is None and os.path.isfile(path):
+            try:
+                os.remove(path)
+                return f"supprimé (fichier créé par pia) : {path}"
+            except Exception as e:
+                return f"ERREUR suppression {path}: {e}"
+    return "rien à annuler."
 
 
 def tool_read_file(args):
@@ -729,11 +758,138 @@ SYSTEM_PROMPT = (
     "sentences. Do not invent file contents — read them first."
 )
 
+# ---------------------------------------------------------------------------
+# Project context file (PIA.md / AGENTS.md / CLAUDE.md), like other agent CLIs
+# ---------------------------------------------------------------------------
+CONTEXT_FILENAMES = ("PIA.md", "AGENTS.md", "CLAUDE.md")
+MAX_CONTEXT_CHARS = 8000  # bounded: this rides along in every request
+
+
+def find_context_file(start=None):
+    """Look for a project context file in cwd, then walk up to the git root."""
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        for name in CONTEXT_FILENAMES:
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+        if os.path.isdir(os.path.join(d, ".git")):
+            break  # don't escape the project
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def build_system_prompt():
+    prompt = SYSTEM_PROMPT
+    path = find_context_file()
+    if path:
+        try:
+            with open(path, "r", errors="replace") as f:
+                extra = f.read(MAX_CONTEXT_CHARS)
+            if extra.strip():
+                prompt += (
+                    f"\n\nProject instructions from {os.path.basename(path)} "
+                    f"(follow them):\n{extra}"
+                )
+        except Exception:
+            pass
+    return prompt
+
+
+# ---------------------------------------------------------------------------
+# User-defined slash commands: ~/.config/pia/commands/NAME.md
+# ---------------------------------------------------------------------------
+def commands_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, APP_NAME, "commands")
+
+
+def load_custom_commands():
+    """Return {name: template}. '$ARGUMENTS' in a template is replaced at call time."""
+    d = commands_dir()
+    out = {}
+    try:
+        names = os.listdir(d)
+    except Exception:
+        return out
+    for fn in names:
+        if not fn.endswith(".md"):
+            continue
+        try:
+            with open(os.path.join(d, fn), "r", errors="replace") as f:
+                out[fn[:-3]] = f.read()
+        except Exception:
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+# @file mentions — inline a file's contents into the prompt
+# ---------------------------------------------------------------------------
+FILE_MENTION_RE = re.compile(r"@([A-Za-z0-9_./~-]+)")
+MAX_MENTION_CHARS = 20000
+
+
+def expand_mentions(text):
+    """Inline the contents of @-mentioned files that actually exist."""
+    seen = []
+    for m in FILE_MENTION_RE.finditer(text):
+        raw = m.group(1)
+        p = os.path.expanduser(raw)
+        if raw in [s[0] for s in seen]:
+            continue
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", errors="replace") as f:
+                    seen.append((raw, f.read(MAX_MENTION_CHARS)))
+            except Exception:
+                continue
+    if not seen:
+        return text
+    parts = [text]
+    for name, content in seen:
+        parts.append(f"\n\n--- {name} ---\n{content}")
+        eprint(dim(f"  (joint : {name})"))
+    return "".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # HTTP / model call
 # ---------------------------------------------------------------------------
-def http_chat(provider, messages, tools, stream, timeout):
+RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+MAX_RETRIES = 4
+
+
+def http_chat(provider, messages, tools, stream, timeout, echo=True):
+    """POST /chat/completions, retrying transient failures.
+
+    The CHIP's wifi drops often, so network errors and 5xx/429 responses are
+    retried with exponential backoff. Auth/config errors (401/403/404) are not
+    retried — they will never succeed on their own.
+    """
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return _http_chat_once(provider, messages, tools, stream, timeout, echo)
+        except RetryableError as e:
+            last_err = e
+            if attempt == MAX_RETRIES - 1:
+                break
+            delay = 2 ** attempt  # 1s, 2s, 4s
+            brief = str(e).split("\n")[0][:60]  # keep it to one short line
+            eprint(dim(f"  ({brief} — nouvel essai dans {delay}s…)"))
+            time.sleep(delay)
+    raise RuntimeError(str(last_err))
+
+
+class RetryableError(Exception):
+    pass
+
+
+def _http_chat_once(provider, messages, tools, stream, timeout, echo=True):
     url = provider["base_url"].rstrip("/") + "/chat/completions"
     payload = {
         "model": provider["model"],
@@ -765,20 +921,25 @@ def http_chat(provider, messages, tools, stream, timeout):
             detail = e.read().decode("utf-8", errors="replace")
         except Exception:
             pass
-        raise RuntimeError(f"HTTP {e.code} from {url}\n{detail[:800]}")
+        msg = f"HTTP {e.code} from {url}\n{detail[:800]}"
+        if e.code in RETRY_STATUSES:
+            raise RetryableError(msg)
+        raise RuntimeError(msg)
     except urllib.error.URLError as e:
-        raise RuntimeError(f"connection failed to {url}: {e.reason}")
+        raise RetryableError(f"connexion échouée vers {url}: {e.reason}")
+    except OSError as e:  # socket timeouts, connection reset, ...
+        raise RetryableError(f"erreur réseau vers {url}: {e}")
 
     if stream:
-        return _read_stream(resp)
-    return _read_full(resp)
+        return _read_stream(resp, echo)
+    return _read_full(resp, echo)
 
 
-def _read_full(resp):
+def _read_full(resp, echo=True):
     obj = json.loads(resp.read().decode("utf-8", errors="replace"))
     msg = obj["choices"][0]["message"]
     content = msg.get("content") or ""
-    if content:
+    if content and echo:
         sys.stdout.write(wrap(content))
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -795,7 +956,7 @@ def _read_full(resp):
     return content, tool_calls, usage
 
 
-def _read_stream(resp):
+def _read_stream(resp, echo=True):
     content_parts = []
     slots = {}  # index -> {id, name, arguments}
     usage = {}
@@ -819,10 +980,11 @@ def _read_stream(resp):
         delta = choices[0].get("delta") or {}
         piece = delta.get("content")
         if piece:
-            sys.stdout.write(piece)
-            sys.stdout.flush()
+            if echo:
+                sys.stdout.write(piece)
+                sys.stdout.flush()
+                printed_any = True
             content_parts.append(piece)
-            printed_any = True
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
             slot = slots.setdefault(idx, {"id": "", "name": "", "arguments": ""})
@@ -999,6 +1161,125 @@ def agent_turn(cfg, provider, messages):
 
 
 # ---------------------------------------------------------------------------
+# Extra REPL features: model listing, context compaction, git helpers
+# ---------------------------------------------------------------------------
+def fetch_models(provider, timeout=30):
+    """GET {base_url}/models — returns a list of model ids."""
+    url = provider["base_url"].rstrip("/") + "/models"
+    headers = {"Accept": "application/json"}
+    if provider.get("api_key"):
+        headers["Authorization"] = "Bearer " + provider["api_key"]
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            obj = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} depuis {url}")
+    except Exception as e:
+        raise RuntimeError(f"échec de la requête vers {url}: {e}")
+    items = obj.get("data") if isinstance(obj, dict) else obj
+    ids = []
+    for it in items or []:
+        if isinstance(it, dict) and it.get("id"):
+            ids.append(it["id"])
+        elif isinstance(it, str):
+            ids.append(it)
+    return sorted(ids)
+
+
+def compact_history(cfg, provider, messages):
+    """Replace the conversation with a short summary to free RAM and context."""
+    body = [m for m in messages if m.get("role") in ("user", "assistant")]
+    if len(body) < 2:
+        return False, "conversation trop courte pour être compactée."
+    convo = []
+    for m in body:
+        content = m.get("content") or ""
+        if content:
+            convo.append(f"{m['role']}: {content}")
+    ask = [
+        {
+            "role": "system",
+            "content": "Summarize the conversation so far in at most 10 bullet "
+            "points: what the user wants, decisions made, files changed, and "
+            "what is left to do. Be terse and factual.",
+        },
+        {"role": "user", "content": "\n\n".join(convo)[:30000]},
+    ]
+    try:
+        content, _, _ = http_chat(
+            provider, ask, None, False, int(cfg.get("request_timeout", 180)), echo=False
+        )
+    except RuntimeError as e:
+        return False, str(e)
+    if not content.strip():
+        return False, "le modèle n'a rien renvoyé."
+    messages[:] = [
+        {"role": "system", "content": build_system_prompt()},
+        {"role": "assistant", "content": "Résumé de la session précédente :\n" + content},
+    ]
+    return True, content
+
+
+def git_here(args, timeout=30):
+    """Run a git command in the current directory. Returns (rc, out)."""
+    try:
+        p = subprocess.run(
+            ["git"] + args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+        return p.returncode, p.stdout.decode("utf-8", "replace")
+    except Exception as e:
+        return 1, str(e)
+
+
+def git_commit_with_model(cfg, provider, messages_unused=None):
+    """Write a commit message from the staged diff, confirm, then commit."""
+    rc, diff = git_here(["diff", "--staged"])
+    if rc != 0:
+        return "pas un dépôt git (ou git indisponible)."
+    if not diff.strip():
+        return "rien dans l'index : utilise d'abord `git add`."
+    ask = [
+        {
+            "role": "system",
+            "content": "Write a concise git commit message for this staged diff. "
+            "First line: imperative summary under 72 chars. Then a blank line and "
+            "2-4 bullet points if the change is non-trivial. Output only the "
+            "message, no code fences, no preamble.",
+        },
+        {"role": "user", "content": diff[:30000]},
+    ]
+    try:
+        msg, _, _ = http_chat(
+            provider, ask, None, False, int(cfg.get("request_timeout", 180)), echo=False
+        )
+    except RuntimeError as e:
+        return str(e)
+    msg = msg.strip()
+    if not msg:
+        return "le modèle n'a pas proposé de message."
+    print(cyan("\n--- message proposé ---"))
+    print(wrap(msg))
+    print(cyan("-----------------------"))
+    if not cfg.get("auto_approve") and confirm_action("Committer ?") == "n":
+        return "annulé."
+    rc, out = git_here(["commit", "-m", msg])
+    return out.strip() or ("commit OK" if rc == 0 else "échec du commit")
+
+
+INIT_PROMPT = (
+    "Explore this project (list_dir, glob_search, grep_search, read_file) and "
+    "write a PIA.md file at the project root. It must be short (under 40 lines) "
+    "and contain: what the project does, how to build/run/test it, the layout of "
+    "the main directories, and any conventions a new contributor must follow. "
+    "Write it with write_file."
+)
+
+
+# ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
 HELP = """\
@@ -1015,8 +1296,18 @@ commands:
   /sessions        list saved conversations
   /usage           show tokens used this session
   /tools           list available tools
+  /models          list the models this provider offers
+  /compact         replace history with a short summary (frees RAM)
+  /undo            revert the last file pia changed
+  /diff            show `git diff`
+  /commit          write a commit message for the staged diff, then commit
+  /init            generate a PIA.md describing this project
+  /commands        list your custom commands
   /exit, /quit     leave (Ctrl-D also works)
-Tip: end a line with \\ to keep typing on the next line.
+Also:
+  !cmd             run a shell command directly (no tokens spent)
+  @path/to/file    attach a file's contents to your message
+  line ending in \\ continues on the next line
 Type anything else to talk to the model."""
 
 
@@ -1068,7 +1359,7 @@ def repl(cfg, provider, check_update=True, resume=False):
         except Exception:
             pass
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": build_system_prompt()}]
     if resume:
         try:
             loaded = load_session("last")
@@ -1079,6 +1370,10 @@ def repl(cfg, provider, check_update=True, resume=False):
             pass
 
     print_banner(provider, cfg)
+    ctx = find_context_file()
+    if ctx:
+        print(dim(f"contexte projet : {os.path.basename(ctx)}"))
+    custom = load_custom_commands()
 
     while True:
         try:
@@ -1094,6 +1389,17 @@ def repl(cfg, provider, check_update=True, resume=False):
         if not line:
             continue
 
+        # shell escape: run it directly, no model call, no tokens spent
+        if line.startswith("!"):
+            cmd = line[1:].strip()
+            if cmd:
+                out = tool_run_bash({"command": cmd})
+                print(wrap(out))
+                messages.append(
+                    {"role": "user", "content": f"(J'ai lancé `{cmd}`)\n{out}"}
+                )
+            continue
+
         if line.startswith("/"):
             parts = line.split()
             cmd = parts[0]
@@ -1103,7 +1409,7 @@ def repl(cfg, provider, check_update=True, resume=False):
             elif cmd == "/help":
                 print(HELP)
             elif cmd == "/reset":
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                messages = [{"role": "system", "content": build_system_prompt()}]
                 print(dim("conversation cleared."))
             elif cmd == "/model":
                 if arg:
@@ -1122,6 +1428,9 @@ def repl(cfg, provider, check_update=True, resume=False):
                 if arg:
                     try:
                         os.chdir(os.path.expanduser(arg))
+                        # the project context file may differ in the new dir
+                        if messages and messages[0].get("role") == "system":
+                            messages[0]["content"] = build_system_prompt()
                     except Exception as e:
                         eprint(red(str(e)))
                 print(dim(os.getcwd()))
@@ -1158,11 +1467,63 @@ def repl(cfg, provider, check_update=True, resume=False):
             elif cmd == "/tools":
                 for name in TOOLS:
                     print(dim("  " + name))
+            elif cmd == "/models":
+                try:
+                    ids = fetch_models(provider)
+                    if ids:
+                        for i in ids:
+                            marker = " *" if i == provider["model"] else ""
+                            print(dim("  " + i + marker))
+                    else:
+                        print(dim("(aucun modèle renvoyé)"))
+                except RuntimeError as e:
+                    eprint(red(str(e)))
+            elif cmd == "/compact":
+                ok, info = compact_history(cfg, provider, messages)
+                if ok:
+                    print(dim("historique compacté :"))
+                    print(wrap(info))
+                else:
+                    eprint(red(info))
+            elif cmd == "/undo":
+                print(dim(undo_last_edit()))
+            elif cmd == "/diff":
+                rc, out = git_here(["diff"] + (arg.split() if arg else []))
+                print(wrap(out.strip() or "(aucune modification)"))
+            elif cmd == "/commit":
+                print(dim(git_commit_with_model(cfg, provider)))
+            elif cmd == "/init":
+                messages.append({"role": "user", "content": INIT_PROMPT})
+                try:
+                    agent_turn(cfg, provider, messages)
+                except RuntimeError as e:
+                    eprint(red(str(e)))
+            elif cmd == "/commands":
+                custom = load_custom_commands()
+                if custom:
+                    for name in sorted(custom):
+                        print(dim("  /" + name))
+                else:
+                    print(dim(f"(aucune ; crée des .md dans {commands_dir()})"))
+            elif cmd[1:] in custom:
+                template = custom[cmd[1:]]
+                text = (
+                    template.replace("$ARGUMENTS", arg)
+                    if "$ARGUMENTS" in template
+                    else (template + ("\n\n" + arg if arg else ""))
+                )
+                messages.append({"role": "user", "content": expand_mentions(text)})
+                try:
+                    agent_turn(cfg, provider, messages)
+                except RuntimeError as e:
+                    eprint(red(str(e)))
+                except KeyboardInterrupt:
+                    eprint(dim("\n(interrupted)"))
             else:
                 eprint(red(f"unknown command {cmd} (try /help)"))
             continue
 
-        messages.append({"role": "user", "content": line})
+        messages.append({"role": "user", "content": expand_mentions(line)})
         try:
             agent_turn(cfg, provider, messages)
         except RuntimeError as e:
@@ -1180,8 +1541,8 @@ def repl(cfg, provider, check_update=True, resume=False):
 # ---------------------------------------------------------------------------
 def one_shot(cfg, provider, prompt):
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
+        {"role": "system", "content": build_system_prompt()},
+        {"role": "user", "content": expand_mentions(prompt)},
     ]
     agent_turn(cfg, provider, messages)
 

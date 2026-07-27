@@ -63,6 +63,18 @@ with open(path, "w") as f:
 PY
 echo "auto-update configure (repo : $SRC_DIR)"
 
+# 3c. commandes personnalisees d'exemple (ne remplace jamais les tiennes)
+CMD_DIR="$CFG_DIR/commands"
+mkdir -p "$CMD_DIR"
+for f in "$SRC_DIR"/commands-example/*.md; do
+  [ -f "$f" ] || continue
+  target="$CMD_DIR/$(basename "$f")"
+  if [ ! -f "$target" ]; then
+    cp "$f" "$target"
+  fi
+done
+echo "commandes personnalisees : $CMD_DIR"
+
 # 4. rappel PATH
 case ":$PATH:" in
   *":$BIN_DIR:"*) : ;;
