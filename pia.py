@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -94,7 +94,11 @@ DEFAULT_CONFIG = {
     "stream": True,
     "max_steps": 25,
     "request_timeout": 180,
-    "max_history_messages": 40,  # trim oldest turns beyond this to bound RAM/context
+    "max_history_messages": 40,  # backstop; the token budget below does the real work
+    # tokens this model accepts. null = guess from the model name, falling back
+    # to a conservative default. Set it if you know the real figure.
+    "context_limit": None,
+    "auto_compact": False,  # summarise automatically instead of just warning
     "update": {
         # repo_dir is filled in by install.sh (path of your local git clone).
         "enabled": True,
@@ -867,7 +871,104 @@ def find_context_file(start=None):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Environment block — tell the model what machine it is actually driving
+# ---------------------------------------------------------------------------
+def _os_name():
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    try:
+        return os.uname().sysname
+    except Exception:
+        return "unknown"
+
+
+def _machine():
+    try:
+        return os.uname().machine
+    except Exception:
+        return "unknown"
+
+
+def total_ram_mb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return None
+
+
+def _git_context():
+    """Branch and dirtiness, or None when this is not a git checkout."""
+    if not shutil.which("git"):
+        return None
+    rc, out, _ = _run_git(".", ["rev-parse", "--abbrev-ref", "HEAD"], timeout=5)
+    if rc != 0:
+        return None
+    branch = out or "HEAD"
+    rc2, status, _ = _run_git(".", ["status", "--porcelain"], timeout=5)
+    if rc2 != 0:
+        return f"branch {branch}"
+    n = len([l for l in status.split("\n") if l.strip()])
+    return f"branch {branch}, {n} fichier(s) modifie(s)" if n else f"branch {branch}, propre"
+
+
+def environment_block():
+    """Compact facts about this machine, so the model stops guessing.
+
+    Ordered stable-first, volatile-last: providers cache on a shared prefix,
+    and putting the date or git status up top would bust that cache every
+    turn (opencode has this exact bug, their issue #5224).
+
+    Deliberately no file tree: opencode ships up to 200 entries, which would
+    cost more tokens per turn than this machine's whole session budget.
+    """
+    ram = total_ram_mb()
+    lines = [
+        f"os: {_os_name()} ({_machine()})",
+        f"python: {sys.version.split()[0]}",
+        f"shell: {os.environ.get('SHELL', 'sh')}",
+    ]
+    if ram:
+        lines.append(f"ram: {ram} MB total")
+    lines.append(f"terminal: {term_width()}x{term_height()} caracteres")
+    lines.append(f"cwd: {os.getcwd()}")
+    git = _git_context()
+    lines.append(f"git: {git}" if git else "git: pas un depot git")
+    lines.append(f"date: {time.strftime('%Y-%m-%d')}")
+
+    block = "<environment>\n" + "\n".join(lines) + "\n</environment>"
+
+    notes = []
+    if ram and ram < 1024:
+        notes.append(
+            "This machine has very little RAM: never run full builds, test "
+            "suites or installs unless asked; prefer targeted commands."
+        )
+    if term_width() <= 60:
+        notes.append(
+            "The screen is tiny: keep every reply to a few short lines, and "
+            "avoid printing long files or command output."
+        )
+    if notes:
+        block += "\n" + " ".join(notes)
+    return block
+
+
 def build_system_prompt():
+    """Assemble: static instructions, then project rules, then environment.
+
+    The environment goes last on purpose — it is the part that changes
+    between sessions, so everything above it stays cacheable.
+    """
     prompt = SYSTEM_PROMPT
     path = find_context_file()
     if path:
@@ -881,6 +982,10 @@ def build_system_prompt():
                 )
         except Exception:
             pass
+    try:
+        prompt += "\n\n" + environment_block()
+    except Exception:
+        pass  # never let environment detection break startup
     return prompt
 
 
@@ -1172,21 +1277,83 @@ def run_tool(name, arguments_str, cfg):
     return fn(args)
 
 
-def trim_history(messages, max_messages):
-    """Drop the oldest whole turns once history grows past max_messages.
+# ---------------------------------------------------------------------------
+# Context budget — conditioned on the model, not on a fixed message count
+# ---------------------------------------------------------------------------
+# Hints only, and deliberately conservative: guessing low just trims early,
+# guessing high overflows the request and the API rejects it outright. A
+# `context_limit` in the config (global or per provider) always wins, and
+# /context shows which value is in force.
+KNOWN_CONTEXT_LIMITS = (
+    ("claude", 200000),
+    ("gpt-4o", 128000),
+    ("gpt-5", 200000),
+    ("gemini", 200000),
+    ("kimi", 128000),
+    ("qwen", 128000),
+    ("deepseek", 128000),
+    ("grok", 128000),
+    ("minimax", 128000),
+    ("llama", 128000),
+    ("mistral", 128000),
+)
+DEFAULT_CONTEXT_LIMIT = 32000
+COMPACT_THRESHOLD = 0.75  # warn/compact once the prompt passes this share
+
+
+def context_limit(cfg, provider):
+    """Tokens this model can take, and where that number came from."""
+    for src, holder in (("config", provider), ("config", cfg)):
+        v = holder.get("context_limit")
+        if v:
+            return int(v), src
+    model = (provider.get("model") or "").lower()
+    for key, lim in KNOWN_CONTEXT_LIMITS:
+        if key in model:
+            return lim, "table"
+    return DEFAULT_CONTEXT_LIMIT, "defaut"
+
+
+def estimate_tokens(messages):
+    """Rough token count (~4 chars/token). Used before the API tells us."""
+    total = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        for tc in m.get("tool_calls") or []:
+            total += len((tc.get("function") or {}).get("arguments") or "")
+        total += 16  # per-message envelope
+    return total // 4
+
+
+def trim_history(messages, max_messages, token_budget=None):
+    """Drop the oldest whole turns to stay inside both budgets.
 
     A "turn" starts at a user message, so tool_call/tool-result pairs are
-    never split apart. Keeps RAM and API context bounded on long sessions.
+    never split apart. The token budget is what actually protects the request
+    from being rejected; max_messages is just a backstop. Returns how many
+    messages were dropped.
     """
-    if max_messages <= 0:
-        return
     system = messages[:1] if messages and messages[0].get("role") == "system" else []
     rest = messages[len(system):]
-    while len(rest) > max_messages and rest:
+    dropped = 0
+
+    def too_big():
+        if max_messages > 0 and len(rest) > max_messages:
+            return True
+        if token_budget and estimate_tokens(system + rest) > token_budget:
+            return True
+        return False
+
+    while rest and too_big():
         rest.pop(0)
+        dropped += 1
         while rest and rest[0].get("role") != "user":
             rest.pop(0)
+            dropped += 1
     messages[:] = system + rest
+    return dropped
 
 
 def agent_turn(cfg, provider, messages):
@@ -1195,8 +1362,12 @@ def agent_turn(cfg, provider, messages):
     timeout = int(cfg.get("request_timeout", 180))
     max_history = int(cfg.get("max_history_messages", 40))
     usage_total = cfg.setdefault("_usage", {"prompt": 0, "completion": 0, "total": 0})
+    limit, _src = context_limit(cfg, provider)
+    budget = int(limit * COMPACT_THRESHOLD)
 
-    trim_history(messages, max_history)
+    dropped = trim_history(messages, max_history, token_budget=budget)
+    if dropped:
+        eprint(dim(f"  (contexte plein : {dropped} anciens messages retires)"))
 
     for _ in range(max_steps):
         content, tool_calls, usage = http_chat(
@@ -1210,13 +1381,25 @@ def agent_turn(cfg, provider, messages):
         if not tool_calls:
             messages.append({"role": "assistant", "content": content})
             if usage:
+                prompt_tok = usage.get("prompt_tokens", 0) or 0
+                cfg["_last_prompt_tokens"] = prompt_tok
+                pct = round(100 * prompt_tok / limit) if limit else 0
                 eprint(
                     dim(
-                        f"  [{usage.get('prompt_tokens', 0)}+"
-                        f"{usage.get('completion_tokens', 0)} tok this turn, "
-                        f"{usage_total['total']} total this session]"
+                        f"  [{prompt_tok}+{usage.get('completion_tokens', 0)} tok · "
+                        f"contexte {pct}% · session {usage_total['total']}]"
                     )
                 )
+                if pct >= COMPACT_THRESHOLD * 100:
+                    eprint(
+                        yellow(
+                            f"  contexte a {pct}% — /compact pour resumer"
+                            + (" (auto)" if cfg.get("auto_compact") else "")
+                        )
+                    )
+                    if cfg.get("auto_compact"):
+                        ok, info = compact_history(cfg, provider, messages)
+                        eprint(dim("  compacte." if ok else f"  {info}"))
             return
 
         # record the assistant's tool-call turn
@@ -1605,6 +1788,8 @@ session
   /load [nom]   recharger
   /sessions     liste des sessions
   /usage        tokens consommes
+  /context      place restante
+  /env          ce que le modele sait
   /compact      resume (libere la RAM)
 modele
   /model        choisir (fleches+filtre)
@@ -1795,6 +1980,19 @@ def repl(cfg, provider, check_update=True, resume=False):
                         f"total={u['total']} tokens"
                     )
                 )
+            elif cmd == "/context":
+                lim, src = context_limit(cfg, provider)
+                est = estimate_tokens(messages)
+                real = cfg.get("_last_prompt_tokens")
+                print(dim(f"limite  : {lim} tok ({src})"))
+                print(dim(f"estime  : {est} tok ({round(100 * est / lim)}%)"))
+                if real:
+                    print(dim(f"reel API: {real} tok ({round(100 * real / lim)}%)"))
+                print(dim(f"messages: {len(messages)}"))
+                if src != "config":
+                    print(dim('regle "context_limit" dans la config si c\'est faux'))
+            elif cmd == "/env":
+                print(wrap(environment_block()))
             elif cmd == "/tools":
                 for name in TOOLS:
                     print(dim("  " + name))

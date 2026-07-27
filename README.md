@@ -134,6 +134,67 @@ jour.
 
 ---
 
+## Ce que le modèle sait de ta machine
+
+À chaque session, `pia` injecte un bloc décrivant l'environnement réel — sinon
+le modèle devine, et devine mal (mauvaise date, commandes x86 sur une machine
+ARM, chemins inventés) :
+
+```
+<environment>
+os: Debian GNU/Linux 11 (bullseye) (armv7l)
+python: 3.9.2
+shell: /bin/bash
+ram: 498 MB total
+terminal: 53x16 caracteres
+cwd: /home/chip/monprojet
+git: branch main, 2 fichier(s) modifie(s)
+date: 2026-07-27
+</environment>
+```
+
+Quand la RAM est faible ou l'écran étroit, une consigne est ajoutée
+automatiquement : ne pas lancer de build complet, garder les réponses courtes.
+
+Tape **`/env`** pour voir exactement ce qui est envoyé.
+
+Deux choix assumés, différents d'OpenCode :
+
+- **pas d'arborescence de fichiers** (OpenCode en envoie jusqu'à 200) : ça
+  coûterait plus de tokens par tour que tout le reste réuni. Le modèle a
+  `glob_search` et `grep_search` pour explorer quand il en a besoin.
+- **bloc placé en dernier**, après les instructions statiques : la partie
+  volatile (git, date) ne casse pas la mise en cache du préfixe côté
+  fournisseur.
+
+Coût total : **~80 tokens par requête**.
+
+---
+
+## Budget de contexte
+
+`pia` adapte l'historique à la **fenêtre de contexte du modèle**, pas à un
+nombre fixe de messages :
+
+- la limite vient de `context_limit` dans la config si tu la renseignes,
+  sinon d'une petite table par famille de modèle, sinon d'un défaut prudent
+  (32 000 tokens) ;
+- l'historique est **élagué par tours entiers** avant l'envoi, pour ne jamais
+  dépasser — un appel d'outil n'est jamais séparé de sa réponse ;
+- après chaque tour, le pourcentage réel est affiché :
+  `[1200+80 tok · contexte 12% · session 3400]` ;
+- au-delà de 75 %, `pia` te propose `/compact`. Mets `"auto_compact": true`
+  dans la config pour qu'il résume tout seul.
+
+`/context` affiche la limite en vigueur, d'où elle vient, et la place
+consommée. **Si le chiffre est faux pour ton modèle, corrige-le** :
+
+```json
+{ "providers": { "opencode": { "context_limit": 262144 } } }
+```
+
+---
+
 ## Contexte projet (`PIA.md`)
 
 Comme le `CLAUDE.md` de Claude Code ou le `AGENTS.md` d'OpenCode, `pia` cherche
@@ -215,6 +276,8 @@ Commandes du REPL :
 | `/load [nom]`       | recharge une conversation sauvegardée             |
 | `/sessions`         | liste les conversations sauvegardées              |
 | `/usage`            | tokens consommés depuis le début de la session    |
+| `/context`          | limite du modèle et place restante                |
+| `/env`              | ce que le modèle sait de ta machine               |
 | `/tools`            | liste les outils                                 |
 | `/model`            | **sélecteur** de modèle (flèches + filtre)         |
 | `/models`           | idem                                              |
@@ -343,11 +406,10 @@ ancien), `NO_COLOR=1 pia` désactive toutes les couleurs.
 - La sortie des outils renvoyée au modèle est tronquée (~12 ko), et les
   fichiers de plus de 2 Mo sont ignorés par `grep_search`, pour économiser la
   RAM et le contexte.
-- **L'historique de conversation est tronqué automatiquement** au-delà de
-  `max_history_messages` (40 par défaut, réglable dans la config) : les tours
-  les plus anciens sont supprimés par blocs entiers pour ne jamais couper un
-  appel d'outil de sa réponse. `/compact` fait le ménage plus agressivement en
-  remplaçant tout l'historique par un résumé.
+- **L'historique est élagué selon la fenêtre de contexte du modèle** (voir
+  « Budget de contexte » plus haut), par blocs de tours entiers pour ne jamais
+  couper un appel d'outil de sa réponse. `max_history_messages` reste un
+  garde-fou secondaire. `/compact` va plus loin en résumant tout l'historique.
 - **Reprise réseau automatique** : une coupure wifi, un timeout ou une réponse
   429/5xx sont réessayés jusqu'à 4 fois (1s, 2s, 4s). Une clé invalide (401/403)
   échoue immédiatement, sans réessai inutile.
@@ -410,6 +472,17 @@ ancien), `NO_COLOR=1 pia` désactive toutes les couleurs.
 
 Par choix, pour rester léger sur cette machine : pas d'interface graphique,
 pas de coloration syntaxique, pas de MCP, pas de sous-agents, pas d'images.
+
+Écarts assumés par rapport à OpenCode, après comparaison :
+
+| OpenCode                                   | `pia`                                  |
+|--------------------------------------------|----------------------------------------|
+| métadonnées modèles depuis models.dev (HTTP) | table locale + `context_limit` en config — pas d'appel réseau, marche hors ligne |
+| arborescence jusqu'à 200 fichiers dans le prompt | aucune — trop chère en tokens ; le modèle explore avec `grep`/`glob` |
+| prompt système différent par famille de modèle | un seul prompt                        |
+| instructions git figées dans l'outil bash (~1300 tok/tour) | rien de tel                   |
+| intégration LSP / diagnostics               | non                                    |
+
 Si tu as besoin de tout ça, utilise Claude Code ou OpenCode sur une machine
 plus puissante — `pia` vise le cas « je suis sur mon Pocket C.H.I.P et je veux
 coder ».
