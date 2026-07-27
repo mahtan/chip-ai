@@ -87,7 +87,8 @@ pia -p kimi -m kimi-k3   # ... avec un modèle précis
 
 ## Mise à jour automatique
 
-`pia` est lié à ton clone git local (chemin enregistré par `install.sh`). Au
+`pia` est lié à ton clone git local (chemin enregistré par `install.sh`) et
+suit **la branche sur laquelle se trouve ce clone** — normalement `main`. Au
 lancement du mode interactif, il fait un `git fetch` discret : s'il y a des
 nouveaux commits, il **te propose** de mettre à jour (`git pull` +
 réinstallation du binaire + redémarrage). Ça marche aussi avec un dépôt privé,
@@ -329,7 +330,9 @@ modifié depuis sa sauvegarde, ou supprime le fichier si `pia` venait de le cré
 - **`SyntaxError`** → ton Python est trop ancien (< 3.6). Vérifie
   `python3 --version`.
 - **L'auto-update ne trouve rien** → vérifie `repo_dir` dans
-  `~/.config/pia/config.json` (doit pointer vers ton clone git).
+  `~/.config/pia/config.json` (doit pointer vers ton clone git), et que ce
+  clone est bien sur une branche suivie : `git -C <clone> status -sb` doit
+  afficher quelque chose comme `## main...origin/main`.
 - **« non-interactif : action refusée »** → normal si stdin n'est pas un
   terminal (pipe/script) ; relance avec `--yolo` si l'action est voulue.
 - **Ça réessaie en boucle** → le serveur répond 429/5xx ou le wifi lâche ;
