@@ -1,0 +1,29 @@
+{
+  "provider": "opencode",
+  "providers": {
+    "opencode": {
+      "base_url": "https://opencode.ai/zen/v1",
+      "api_key_env": "OPENCODE_ZEN_API_KEY",
+      "model": "big-pickle"
+    },
+    "kimi": {
+      "base_url": "https://api.moonshot.ai/v1",
+      "api_key_env": "MOONSHOT_API_KEY",
+      "model": "kimi-k2.5"
+    },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "model": "gpt-4o-mini"
+    },
+    "local": {
+      "base_url": "http://127.0.0.1:8080/v1",
+      "api_key_env": "LOCAL_API_KEY",
+      "model": "local-model"
+    }
+  },
+  "auto_approve": false,
+  "stream": true,
+  "max_steps": 25,
+  "request_timeout": 180
+}
