@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -366,12 +366,27 @@ def red(s):
     return c("31", s)
 
 
+# Fallback size used only when detection fails. Deliberately small: the stock
+# Pocket C.H.I.P screen is 480x272, which is roughly 50x16 characters. Guessing
+# too wide garbles that screen; guessing too narrow is merely a bit cramped on
+# a big one.
+FALLBACK_SIZE = (50, 16)
+
+
 def term_width():
     try:
-        w = shutil.get_terminal_size((60, 20)).columns
+        w = shutil.get_terminal_size(FALLBACK_SIZE).columns
     except Exception:
-        w = 60
+        w = FALLBACK_SIZE[0]
     return max(20, w)
+
+
+def term_height():
+    try:
+        h = shutil.get_terminal_size(FALLBACK_SIZE).lines
+    except Exception:
+        h = FALLBACK_SIZE[1]
+    return max(8, h)
 
 
 def eprint(*a):
@@ -381,6 +396,60 @@ def eprint(*a):
 def die(msg, code=1):
     eprint(red("error: ") + msg)
     sys.exit(code)
+
+
+class StreamWrap:
+    """Word-wraps text arriving token by token.
+
+    textwrap needs the whole string up front, which streaming does not have.
+    This tracks the current column and holds back the word being typed until a
+    space or newline arrives, so words never get split across the right edge of
+    the Pocket C.H.I.P's narrow screen.
+    """
+
+    def __init__(self, width=None):
+        self.width = max(20, width or term_width())
+        self.col = 0
+        self.word = ""
+
+    def _emit_word(self):
+        if not self.word:
+            return ""
+        out = []
+        w, self.word = self.word, ""
+        # a single token longer than the line (URL, long path) gets hard-split
+        while len(w) > self.width:
+            if self.col > 0:
+                out.append("\n")
+                self.col = 0
+            out.append(w[: self.width])
+            w = w[self.width :]
+            out.append("\n")
+        if self.col + len(w) > self.width:
+            out.append("\n")
+            self.col = 0
+        out.append(w)
+        self.col += len(w)
+        return "".join(out)
+
+    def feed(self, text):
+        out = []
+        for ch in text:
+            if ch == "\n":
+                out.append(self._emit_word())
+                out.append("\n")
+                self.col = 0
+            elif ch in " \t":
+                out.append(self._emit_word())
+                if 0 < self.col < self.width:
+                    out.append(" ")
+                    self.col += 1
+            else:
+                self.word += ch
+        return "".join(out)
+
+    def finish(self):
+        return self._emit_word()
 
 
 def wrap(text, indent=""):
@@ -412,7 +481,13 @@ def _truncate(s, limit=MAX_TOOL_OUTPUT):
     return head + f"\n... [truncated, {len(s) - len(head)} more chars]"
 
 
-MAX_DIFF_LINES = 40  # keep previews short enough for a 480x272 screen
+def diff_budget():
+    """How many diff lines fit while leaving the confirm prompt on screen.
+
+    On the Pocket C.H.I.P (~16 rows) this is about 9 lines: enough to judge a
+    small edit, never enough to scroll the "allow?" question out of sight.
+    """
+    return max(5, term_height() - 7)
 
 
 def make_diff(old, new, path):
@@ -424,14 +499,24 @@ def make_diff(old, new, path):
             fromfile=path,
             tofile=path,
             lineterm="",
+            n=2,  # less context than the default 3: rows are scarce here
         )
     )
     if not diff:
         return None
-    shown = diff[:MAX_DIFF_LINES]
+    # drop the ---/+++ header pair: the path is already shown on the trace line
+    # just above, and two rows matter on a 16-row screen
+    if len(diff) >= 2 and diff[0].startswith("---") and diff[1].startswith("+++"):
+        diff = diff[2:]
+    budget = diff_budget()
+    width = term_width()
+    shown = diff[:budget]
     out = []
     for line in shown:
         line = line.rstrip("\n")
+        # truncate rather than let one long line wrap over several rows
+        if len(line) > width:
+            line = line[: width - 1] + "…"
         if line.startswith("+++") or line.startswith("---"):
             out.append(dim(line))
         elif line.startswith("+"):
@@ -442,8 +527,8 @@ def make_diff(old, new, path):
             out.append(cyan(line))
         else:
             out.append(dim(line))
-    if len(diff) > MAX_DIFF_LINES:
-        out.append(dim(f"... ({len(diff) - MAX_DIFF_LINES} more lines)"))
+    if len(diff) > budget:
+        out.append(dim(f"… (+{len(diff) - budget} lignes)"))
     return "\n".join(out)
 
 
@@ -961,6 +1046,7 @@ def _read_stream(resp, echo=True):
     slots = {}  # index -> {id, name, arguments}
     usage = {}
     printed_any = False
+    sw = StreamWrap()
     for raw in resp:
         line = raw.decode("utf-8", errors="replace").strip()
         if not line or not line.startswith("data:"):
@@ -981,9 +1067,12 @@ def _read_stream(resp, echo=True):
         piece = delta.get("content")
         if piece:
             if echo:
-                sys.stdout.write(piece)
-                sys.stdout.flush()
+                shown = sw.feed(piece)
+                if shown:
+                    sys.stdout.write(shown)
+                    sys.stdout.flush()
                 printed_any = True
+            # history keeps the raw text, never the wrapped version
             content_parts.append(piece)
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
@@ -996,6 +1085,7 @@ def _read_stream(resp, echo=True):
             if fn.get("arguments"):
                 slot["arguments"] += fn["arguments"]
     if printed_any:
+        sys.stdout.write(sw.finish())  # flush the last partial word
         sys.stdout.write("\n")
         sys.stdout.flush()
     content = "".join(content_parts)
@@ -1187,6 +1277,230 @@ def fetch_models(provider, timeout=30):
     return sorted(ids)
 
 
+def save_model(provider_name, model):
+    """Remember the chosen model as this provider's default."""
+    path = config_path()
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    provs = data.setdefault("providers", {})
+    if provider_name not in provs:
+        provs[provider_name] = dict(BUILTIN_PROVIDERS.get(provider_name, {}))
+    provs[provider_name]["model"] = model
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    try:
+        os.chmod(path, 0o600)  # the file may also hold the api key
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Arrow-key menu (stdlib only: termios/tty, no curses, no dependencies)
+# ---------------------------------------------------------------------------
+def _read_key(fd):
+    """Read one keypress in raw mode. Returns (kind, value).
+
+    kind is one of: up, down, enter, quit, back, home, end, char, other.
+    Printable characters come back as ("char", c) so callers can filter.
+    """
+    import select
+
+    ch = os.read(fd, 1)
+    if not ch or ch in (b"\x03", b"\x04"):  # EOF, Ctrl-C, Ctrl-D
+        return ("quit", "")
+    if ch in (b"\r", b"\n"):
+        return ("enter", "")
+    if ch in (b"\x7f", b"\x08"):  # Backspace
+        return ("back", "")
+    if ch == b"\x1b":
+        # bare Esc cancels; Esc [ X is an arrow/navigation sequence
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if not ready:
+            return ("quit", "")
+        seq = os.read(fd, 2)
+        return (
+            {b"[A": "up", b"[B": "down", b"[H": "home", b"[F": "end"}.get(
+                seq, "other"
+            ),
+            "",
+        )
+    try:
+        c = ch.decode("utf-8")
+    except UnicodeDecodeError:
+        return ("other", "")
+    return ("char", c) if c.isprintable() else ("other", "")
+
+
+def _menu_frame(items, sel, top, rows, width, current, query, total):
+    """Render one frame of the menu; returns (text, lines_drawn)."""
+    out = []
+    if not items:
+        out.append("\033[2K" + dim("  (aucun resultat)") + "\r\n")
+        n = 1
+    else:
+        shown = list(range(top, min(top + rows, len(items))))
+        for i in shown:
+            mark = "  (actuel)" if items[i] == current else ""
+            label = (("> " if i == sel else "  ") + items[i] + mark)[: width - 1]
+            if i == sel and USE_COLOR:
+                label = "\033[7m" + label + "\033[0m"  # reverse video
+            out.append("\033[2K" + label + "\r\n")
+        n = len(shown)
+    if query:
+        hint = f"filtre: {query}_ · Entree · Esc annule"
+    else:
+        hint = "tapez pour filtrer · fleches · Entree · Esc"
+    if len(items) != total:
+        hint += f" [{len(items)}/{total}]"
+    elif items and len(items) > rows:
+        hint += f" [{sel + 1}/{len(items)}]"
+    out.append("\033[2K" + dim(hint[: width - 1]) + "\r\n")
+    return "".join(out), n + 1
+
+
+def pick_interactive(items, current=None):
+    """Arrow-key picker with type-to-filter. Returns (handled, chosen_item).
+
+    handled=False means this terminal cannot do raw mode (not a tty, dumb
+    TERM, no termios) and the caller should fall back to a numbered prompt.
+    Filtering matters here: OpenCode Zen alone offers dozens of models, which
+    is a lot to scroll through on a 16-row screen.
+    """
+    if not items:
+        return True, None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False, None
+    if os.environ.get("TERM", "") in ("", "dumb"):
+        return False, None
+    try:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+    except Exception:
+        return False, None
+
+    total = len(items)
+    query = ""
+    view = list(items)
+    sel = view.index(current) if current in view else 0
+    top = 0
+    drawn = 0
+    rows = max(3, term_height() - 3)  # leave room for the hint and the prompt
+    width = term_width()
+    result = None
+    sys.stdout.write("\033[?25l")  # hide cursor while navigating
+    try:
+        tty.setraw(fd)
+        while True:
+            if sel < top:
+                top = sel
+            elif sel >= top + rows:
+                top = sel - rows + 1
+            frame, n = _menu_frame(view, sel, top, rows, width, current, query, total)
+            if drawn:
+                sys.stdout.write(f"\033[{drawn}A")  # rewind to redraw in place
+            sys.stdout.write(frame)
+            sys.stdout.flush()
+            drawn = n
+
+            kind, val = _read_key(fd)
+            if kind == "up" and view:
+                sel = (sel - 1) % len(view)
+            elif kind == "down" and view:
+                sel = (sel + 1) % len(view)
+            elif kind == "home":
+                sel = 0
+            elif kind == "end" and view:
+                sel = len(view) - 1
+            elif kind == "enter":
+                if view:
+                    result = view[sel]
+                break
+            elif kind == "quit":
+                break
+            elif kind in ("char", "back"):
+                query = query[:-1] if kind == "back" else query + val
+                q = query.lower()
+                view = [it for it in items if q in it.lower()] if q else list(items)
+                sel, top = 0, 0
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+        # erase the menu so it does not clutter the tiny screen
+        if drawn:
+            sys.stdout.write(f"\033[{drawn}A" + "\033[J")
+        sys.stdout.write("\033[?25h")  # show cursor again
+        sys.stdout.flush()
+    return True, result
+
+
+def choose_model(cfg, provider):
+    """Numbered model picker: type a number instead of a long model name.
+
+    Deliberately plain stdin/stdout — no curses, no cursor keys — so it works
+    over a flaky SSH link and on the CHIP's own terminal.
+    """
+    try:
+        ids = fetch_models(provider)
+    except RuntimeError as e:
+        eprint(red(str(e)))
+        eprint(dim("ce fournisseur n'expose peut-etre pas /v1/models."))
+        eprint(dim("entre le nom a la main : /model <nom>"))
+        return None
+    if not ids:
+        eprint(dim("(aucun modele renvoye)"))
+        return None
+
+    current = provider.get("model")
+
+    # preferred path: arrow keys + type-to-filter
+    handled, picked = pick_interactive(ids, current=current)
+    if handled:
+        return picked
+
+    # fallback for terminals without raw mode: numbered list
+    width = term_width()
+    for i, mid in enumerate(ids, 1):
+        mark = " *" if mid == current else ""
+        print(dim(f"{i:>2}) {mid}{mark}"[: width - 1]))
+    if not sys.stdin.isatty():
+        return None
+    try:
+        ans = input(yellow("numero (Entree = garder) : ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not ans:
+        return None
+    if not ans.isdigit() or not (1 <= int(ans) <= len(ids)):
+        eprint(red("numero invalide."))
+        return None
+    return ids[int(ans) - 1]
+
+
+def set_model(cfg, provider, model):
+    """Apply a model to the running session and persist it as the default."""
+    provider["model"] = model
+    try:
+        save_model(provider["name"], model)
+        print(dim(f"modele = {model} (enregistre par defaut)"))
+    except Exception as e:
+        print(dim(f"modele = {model} (non enregistre : {e})"))
+
+
 def compact_history(cfg, provider, messages):
     """Replace the conversation with a short summary to free RAM and context."""
     body = [m for m in messages if m.get("role") in ("user", "assistant")]
@@ -1282,55 +1596,56 @@ INIT_PROMPT = (
 # ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
+# Every line kept under 40 columns: the stock Pocket C.H.I.P screen is the
+# narrowest target, and a help screen that wraps is worse than a terse one.
 HELP = """\
-commands:
-  /help            show this help
-  /reset           clear the conversation
-  /model [name]    show or switch model
-  /provider [name] show or switch provider
-  /yolo            toggle auto-approve for write/edit/run
-  /cwd [dir]       show or change working directory
-  /update          check the git repo for updates and offer to install
-  /save [name]     save the conversation (default: "manual")
-  /load [name]     load a saved conversation (default: "manual")
-  /sessions        list saved conversations
-  /usage           show tokens used this session
-  /tools           list available tools
-  /models          list the models this provider offers
-  /compact         replace history with a short summary (frees RAM)
-  /undo            revert the last file pia changed
-  /diff            show `git diff`
-  /commit          write a commit message for the staged diff, then commit
-  /init            generate a PIA.md describing this project
-  /commands        list your custom commands
-  /exit, /quit     leave (Ctrl-D also works)
-Also:
-  !cmd             run a shell command directly (no tokens spent)
-  @path/to/file    attach a file's contents to your message
-  line ending in \\ continues on the next line
-Type anything else to talk to the model."""
+session
+  /reset        efface la conversation
+  /save [nom]   sauvegarder
+  /load [nom]   recharger
+  /sessions     liste des sessions
+  /usage        tokens consommes
+  /compact      resume (libere la RAM)
+modele
+  /model        choisir (fleches+filtre)
+  /model <nom>  changer directement
+  /provider [n] voir/changer fournisseur
+fichiers & git
+  /undo         annule la derniere modif
+  /diff         git diff
+  /commit       message auto + commit
+  /init         genere un PIA.md
+divers
+  /cwd [dir]    dossier de travail
+  /yolo         auto-approbation
+  /tools /commands /update /help
+  /exit         quitter (Ctrl-D aussi)
+raccourcis
+  !cmd          shell direct, 0 token
+  @fichier      joint un fichier
+  \\ en fin de ligne = suite dessous
+  y/N/a : a = ne plus demander"""
 
 
 def print_banner(provider, cfg):
-    print(bold(cyan(f"{APP_NAME}")) + dim(f" v{VERSION}"))
-    key_state = green("key set") if provider.get("api_key") else red("no api key")
-    print(
-        dim(
-            f"provider={provider['name']} model={provider['model']} "
-            f"({key_state})  auto_approve={cfg.get('auto_approve')}"
-        )
-    )
+    """Two compact lines: on a 16-row screen every line counts."""
+    warn = "" if provider.get("api_key") else " (pas de cle)"
+    bits = [f"{provider['name']}/{provider['model']}"]
+    if cfg.get("auto_approve"):
+        bits.append("yolo")
     try:
         batt = battery_status()
     except Exception:
         batt = None
     if batt:
-        cap, status = batt
-        label = f"batt={cap}%"
-        if status:
-            label += f" ({status})"
-        print(dim(label))
-    print(dim("type /help for commands, Ctrl-D to quit"))
+        bits.append(f"batt {batt[0]}%")
+    head = f"{APP_NAME} v{VERSION} "
+    line = " · ".join(bits)
+    room = term_width() - len(head) - len(warn)
+    if len(line) > room:
+        line = line[: max(0, room - 1)] + "…" if room > 1 else ""
+    print(bold(cyan(APP_NAME)) + dim(f" v{VERSION} ") + dim(line) + red(warn))
+    print(dim("/help pour l'aide, Ctrl-D pour quitter"))
 
 
 def _read_input(prompt):
@@ -1412,9 +1727,25 @@ def repl(cfg, provider, check_update=True, resume=False):
                 messages = [{"role": "system", "content": build_system_prompt()}]
                 print(dim("conversation cleared."))
             elif cmd == "/model":
-                if arg:
-                    provider["model"] = arg
-                print(dim(f"model = {provider['model']}"))
+                if arg.isdigit():
+                    # allow "/model 3" using the numbering shown by /models
+                    try:
+                        ids = fetch_models(provider)
+                    except RuntimeError as e:
+                        ids = []
+                        eprint(red(str(e)))
+                    if ids and 1 <= int(arg) <= len(ids):
+                        set_model(cfg, provider, ids[int(arg) - 1])
+                    elif ids:
+                        eprint(red(f"numero hors liste (1-{len(ids)})."))
+                elif arg:
+                    set_model(cfg, provider, arg)
+                else:
+                    picked = choose_model(cfg, provider)
+                    if picked:
+                        set_model(cfg, provider, picked)
+                    else:
+                        print(dim(f"modele = {provider['model']}"))
             elif cmd == "/provider":
                 if arg:
                     provider = resolve_provider(cfg, arg)
@@ -1468,16 +1799,9 @@ def repl(cfg, provider, check_update=True, resume=False):
                 for name in TOOLS:
                     print(dim("  " + name))
             elif cmd == "/models":
-                try:
-                    ids = fetch_models(provider)
-                    if ids:
-                        for i in ids:
-                            marker = " *" if i == provider["model"] else ""
-                            print(dim("  " + i + marker))
-                    else:
-                        print(dim("(aucun modèle renvoyé)"))
-                except RuntimeError as e:
-                    eprint(red(str(e)))
+                picked = choose_model(cfg, provider)
+                if picked:
+                    set_model(cfg, provider, picked)
             elif cmd == "/compact":
                 ok, info = compact_history(cfg, provider, messages)
                 if ok:

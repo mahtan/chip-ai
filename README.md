@@ -83,6 +83,36 @@ pia -p kimi              # Kimi/Moonshot
 pia -p kimi -m kimi-k3   # ... avec un modèle précis
 ```
 
+### 3. Choisir le modèle
+
+`pia` n'embarque **aucune liste de modèles en dur** : il interroge
+`/v1/models` chez ton fournisseur, donc tu vois exactement ce que ton
+abonnement propose. Tape simplement :
+
+```
+pia> /model
+```
+
+Un sélecteur s'ouvre :
+
+```
+  claude-opus-4
+> grok-code            (actuel)
+  kimi-k2.5
+  qwen3-coder
+tapez pour filtrer · fleches · Entree · Esc  [4/57]
+```
+
+- **↑ ↓** pour naviguer, **Entrée** pour valider, **Échap** pour annuler
+- **tape des lettres pour filtrer** — indispensable chez OpenCode Zen qui
+  propose plusieurs dizaines de modèles : taper `kimi` réduit la liste à 3
+- le choix est **enregistré comme modèle par défaut** pour la prochaine fois
+
+Si ton terminal ne gère pas le mode brut (TERM limité, sortie redirigée),
+`pia` bascule automatiquement sur une **liste numérotée** : tu tapes le numéro.
+Et si le fournisseur n'expose pas `/v1/models`, il te le dit clairement —
+tu peux alors donner le nom à la main avec `/model <nom>`.
+
 ---
 
 ## Mise à jour automatique
@@ -176,7 +206,7 @@ Commandes du REPL :
 |---------------------|--------------------------------------------------|
 | `/help`             | aide                                             |
 | `/reset`            | efface la conversation                           |
-| `/model [nom]`      | affiche / change le modèle                       |
+| `/model <nom>`      | change le modèle directement                     |
 | `/provider [nom]`   | affiche / change le fournisseur                  |
 | `/yolo`             | bascule l'auto-approbation (write/edit/run)      |
 | `/cwd [dossier]`    | affiche / change le dossier de travail           |
@@ -186,7 +216,8 @@ Commandes du REPL :
 | `/sessions`         | liste les conversations sauvegardées              |
 | `/usage`            | tokens consommés depuis le début de la session    |
 | `/tools`            | liste les outils                                 |
-| `/models`           | liste les modèles proposés par le fournisseur     |
+| `/model`            | **sélecteur** de modèle (flèches + filtre)         |
+| `/models`           | idem                                              |
 | `/compact`          | remplace l'historique par un résumé (libère la RAM) |
 | `/undo`             | annule la dernière modification de fichier        |
 | `/diff`             | affiche `git diff`                                |
@@ -280,6 +311,32 @@ modifié depuis sa sauvegarde, ou supprime le fichier si `pia` venait de le cré
 
 ---
 
+## Adaptation au petit écran
+
+L'écran du Pocket C.H.I.P fait **480×272 pixels**, soit environ **50×16
+caractères** selon la police du terminal. Vérifie chez toi avec :
+
+```sh
+tput cols; tput lines
+```
+
+Tout l'affichage est calé sur ces contraintes, et **testé** de 40×12 à 120×40 :
+
+| Élément            | Comportement                                              |
+|--------------------|-----------------------------------------------------------|
+| réponses du modèle | coupées aux espaces **pendant le streaming** — aucun mot tronqué en bord d'écran |
+| aperçu diff        | limité à `hauteur − 7` lignes, pour que la question de confirmation reste **toujours visible** |
+| lignes du diff     | tronquées à la largeur (une ligne longue ne se replie pas sur 3 rangées) |
+| `/help`            | toutes les lignes tiennent en 40 colonnes                 |
+| bannière           | 2 lignes, tronquée si le nom du modèle est long           |
+| sélecteur          | fenêtre défilante + filtre, pour ne pas noyer 57 modèles  |
+| repli              | si la taille est indétectable, 50×16 est supposé (jamais plus large que l'écran) |
+
+Si l'affichage reste illisible sur ta machine (police exotique, terminal
+ancien), `NO_COLOR=1 pia` désactive toutes les couleurs.
+
+---
+
 ## Notes pour les petites machines
 
 - La sortie s'adapte à la largeur du terminal (retour à la ligne automatique).
@@ -316,7 +373,7 @@ modifié depuis sa sauvegarde, ou supprime le fichier si `pia` venait de le cré
 | annuler une modification                    | `pia> /undo`                     |
 | committer proprement                        | `pia> /commit`                   |
 | libérer de la RAM en pleine session         | `pia> /compact`                  |
-| voir les modèles disponibles                | `pia> /models`                   |
+| changer de modèle                           | `pia> /model` puis flèches       |
 | documenter le projet pour l'agent           | `pia> /init`                     |
 
 ---
@@ -338,8 +395,11 @@ modifié depuis sa sauvegarde, ou supprime le fichier si `pia` venait de le cré
 - **Ça réessaie en boucle** → le serveur répond 429/5xx ou le wifi lâche ;
   `pia` retente 4 fois puis abandonne avec un message. Vérifie la connexion
   du CHIP (`ping 1.1.1.1`) ou tes crédits chez le fournisseur.
-- **`/models` renvoie une erreur** → tous les fournisseurs n'exposent pas
-  `/v1/models` ; règle le modèle à la main avec `-m` ou dans la config.
+- **`/model` n'affiche pas de liste** → le fournisseur n'expose pas
+  `/v1/models` ; donne le nom à la main : `/model <nom>` (voir la doc du
+  fournisseur, par ex. [opencode.ai/docs/zen](https://opencode.ai/docs/zen/)).
+- **Les flèches ne marchent pas dans le sélecteur** → ton terminal ne gère pas
+  le mode brut ; `pia` bascule alors sur une liste numérotée, tape le numéro.
 - **Mon `PIA.md` est ignoré** → il doit être dans le dossier courant ou un
   dossier parent **à l'intérieur** du dépôt git. Vérifie avec `/cwd`, et
   relance `/reset` après l'avoir créé.
