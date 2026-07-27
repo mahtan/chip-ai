@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -72,6 +72,13 @@ BUILTIN_PROVIDERS = {
         "base_url": "https://opencode.ai/zen/v1",
         "api_key_env": "OPENCODE_ZEN_API_KEY",
         "model": "big-pickle",
+    },
+    # The Go plan is a different tier on a different path, with its own key.
+    # Model left blank on purpose: run /model rather than trust a guess.
+    "opencode-go": {
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "api_key_env": "OPENCODE_GO_API_KEY",
+        "model": "",
     },
     "kimi": {
         "base_url": "https://api.moonshot.ai/v1",
@@ -312,7 +319,7 @@ def offer_update(cfg, restart_argv=None):
         return False
     ok, msg = apply_update(repo_dir)
     if not ok:
-        eprint(red("échec de la mise à jour : " + msg))
+        eprint_err("échec de la mise à jour : " + msg)
         return False
     print(green("mis à jour."))
     if restart_argv is not None:
@@ -405,6 +412,11 @@ def eprint(*a):
 def die(msg, code=1):
     eprint(red("error: ") + msg)
     sys.exit(code)
+
+
+def eprint_err(msg):
+    """Print an error wrapped to the screen: server messages can be long."""
+    eprint(red(wrap(str(msg))))
 
 
 class StreamWrap:
@@ -1142,6 +1154,49 @@ def expand_mentions(text):
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 MAX_RETRIES = 4
 
+# urllib announces itself as "Python-urllib/3.x", which several API front-ends
+# (Cloudflare in particular) reject outright. Identify the client properly.
+USER_AGENT = f"{APP_NAME}/{VERSION}"
+
+
+def request_headers(provider, stream=False, json_accept=False):
+    """Standard headers, plus any per-provider overrides from the config."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json" if json_accept or not stream
+        else "text/event-stream",
+        "User-Agent": USER_AGENT,
+    }
+    if provider.get("api_key"):
+        headers["Authorization"] = "Bearer " + provider["api_key"]
+    # "headers" in the provider config wins, so a blocked setup can be fixed
+    # without touching the code
+    extra = provider.get("headers")
+    if isinstance(extra, dict):
+        headers.update({str(k): str(v) for k, v in extra.items()})
+    return headers
+
+
+def describe_http_error(code, body, url):
+    """Turn an error body into something readable on a 16-row screen.
+
+    Gateways answer with a full HTML page; dumping that raw filled the CHIP's
+    screen with markup and hid the actual problem.
+    """
+    head = body[:400].lower()
+    if "<html" in head or "<!doctype" in head:
+        m = re.search(r"<title>(.*?)</title>", body, re.S | re.I)
+        title = re.sub(r"\s+", " ", m.group(1)).strip() if m else "reponse HTML"
+        msg = f"HTTP {code} depuis {url}\n{title[:120]}"
+        if "cloudflare" in body.lower():
+            msg += (
+                "\nBloque par le pare-feu du fournisseur, pas par l'API elle-meme."
+                "\nVerifie : l'URL de base correspond bien a ton abonnement,"
+                " la cle est valide, et le service est ouvert dans ta region."
+            )
+        return msg
+    return f"HTTP {code} depuis {url}\n{body[:400]}"
+
 
 def http_chat(provider, messages, tools, stream, timeout, echo=True):
     """POST /chat/completions, retrying transient failures.
@@ -1185,12 +1240,7 @@ def _http_chat_once(provider, messages, tools, stream, timeout, echo=True):
         payload["tool_choice"] = "auto"
 
     body = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream" if stream else "application/json",
-    }
-    if provider.get("api_key"):
-        headers["Authorization"] = "Bearer " + provider["api_key"]
+    headers = request_headers(provider, stream)
 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
@@ -1201,7 +1251,7 @@ def _http_chat_once(provider, messages, tools, stream, timeout, echo=True):
             detail = e.read().decode("utf-8", errors="replace")
         except Exception:
             pass
-        msg = f"HTTP {e.code} from {url}\n{detail[:800]}"
+        msg = describe_http_error(e.code, detail, url)
         if e.code in RETRY_STATUSES:
             raise RetryableError(msg)
         raise RuntimeError(msg)
@@ -1530,17 +1580,21 @@ def agent_turn(cfg, provider, messages):
 def fetch_models(provider, timeout=30):
     """GET {base_url}/models — returns a list of model ids."""
     url = provider["base_url"].rstrip("/") + "/models"
-    headers = {"Accept": "application/json"}
-    if provider.get("api_key"):
-        headers["Authorization"] = "Bearer " + provider["api_key"]
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(
+        url, headers=request_headers(provider, json_accept=True)
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             obj = json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code} depuis {url}")
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(describe_http_error(e.code, detail, url))
     except Exception as e:
-        raise RuntimeError(f"échec de la requête vers {url}: {e}")
+        raise RuntimeError(f"echec de la requete vers {url}: {e}")
     items = obj.get("data") if isinstance(obj, dict) else obj
     ids = []
     for it in items or []:
@@ -1730,7 +1784,7 @@ def choose_model(cfg, provider):
     try:
         ids = fetch_models(provider)
     except RuntimeError as e:
-        eprint(red(str(e)))
+        eprint_err(e)
         eprint(dim("ce fournisseur n'expose peut-etre pas /v1/models."))
         eprint(dim("entre le nom a la main : /model <nom>"))
         return None
@@ -2070,7 +2124,7 @@ def repl(cfg, provider, check_update=True, resume=False):
                         ids = fetch_models(provider)
                     except RuntimeError as e:
                         ids = []
-                        eprint(red(str(e)))
+                        eprint_err(e)
                     if ids and 1 <= int(arg) <= len(ids):
                         set_model(cfg, provider, ids[int(arg) - 1])
                     elif ids:
@@ -2100,7 +2154,7 @@ def repl(cfg, provider, check_update=True, resume=False):
                         if messages and messages[0].get("role") == "system":
                             messages[0]["content"] = build_system_prompt()
                     except Exception as e:
-                        eprint(red(str(e)))
+                        eprint_err(e)
                 print(dim(os.getcwd()))
             elif cmd == "/update":
                 if not offer_update(cfg, restart_argv=[a for a in sys.argv[1:]]):
@@ -2110,13 +2164,13 @@ def repl(cfg, provider, check_update=True, resume=False):
                     path = save_session(messages, arg or "manual")
                     print(dim(f"session sauvegardée : {path}"))
                 except Exception as e:
-                    eprint(red(str(e)))
+                    eprint_err(e)
             elif cmd == "/load":
                 try:
                     messages = load_session(arg or "manual")
                     print(dim(f"session chargée ({len(messages)} messages)."))
                 except Exception as e:
-                    eprint(red(str(e)))
+                    eprint_err(e)
             elif cmd == "/sessions":
                 names = list_sessions()
                 if names:
@@ -2158,7 +2212,7 @@ def repl(cfg, provider, check_update=True, resume=False):
                     print(dim("historique compacté :"))
                     print(wrap(info))
                 else:
-                    eprint(red(info))
+                    eprint_err(info)
             elif cmd == "/undo":
                 print(dim(undo_last_edit()))
             elif cmd == "/diff":
@@ -2171,7 +2225,7 @@ def repl(cfg, provider, check_update=True, resume=False):
                 try:
                     agent_turn(cfg, provider, messages)
                 except RuntimeError as e:
-                    eprint(red(str(e)))
+                    eprint_err(e)
             elif cmd == "/commands":
                 custom = load_custom_commands()
                 if custom:
@@ -2190,7 +2244,7 @@ def repl(cfg, provider, check_update=True, resume=False):
                 try:
                     agent_turn(cfg, provider, messages)
                 except RuntimeError as e:
-                    eprint(red(str(e)))
+                    eprint_err(e)
                 except KeyboardInterrupt:
                     eprint(dim("\n(interrupted)"))
             else:
@@ -2201,7 +2255,7 @@ def repl(cfg, provider, check_update=True, resume=False):
         try:
             agent_turn(cfg, provider, messages)
         except RuntimeError as e:
-            eprint(red(str(e)))
+            eprint_err(e)
         except KeyboardInterrupt:
             eprint(dim("\n(interrupted)"))
         try:
@@ -2295,6 +2349,13 @@ def main(argv=None):
                 f"note: pas de clé API trouvée. Enregistre-la une fois pour toutes :\n"
                 f"  {APP_NAME} -p {provider['name']} --set-key TA_CLE\n"
                 f"ou exporte {env_name} (ou PIA_API_KEY) dans ton shell."
+            )
+        )
+    if not provider.get("model"):
+        eprint(
+            yellow(
+                f"note: aucun modele defini pour '{provider['name']}'.\n"
+                f"  {APP_NAME} -m <nom>   ou, dans pia, /model pour choisir."
             )
         )
 

@@ -6,6 +6,11 @@
       "api_key_env": "OPENCODE_ZEN_API_KEY",
       "model": "big-pickle"
     },
+    "opencode-go": {
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "api_key_env": "OPENCODE_GO_API_KEY",
+      "model": ""
+    },
     "kimi": {
       "base_url": "https://api.moonshot.ai/v1",
       "api_key_env": "MOONSHOT_API_KEY",

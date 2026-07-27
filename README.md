@@ -58,8 +58,14 @@ Relancer `sh install.sh` plus tard **met à jour le programme** sans jamais
 | Fournisseur     | Où obtenir la clé            | Variable d'environnement   |
 |-----------------|------------------------------|----------------------------|
 | **OpenCode Zen**| https://opencode.ai/auth     | `OPENCODE_ZEN_API_KEY`     |
+| **OpenCode Go** | https://opencode.ai/auth     | `OPENCODE_GO_API_KEY`      |
 | **Kimi/Moonshot**| https://platform.moonshot.ai | `MOONSHOT_API_KEY`        |
 | **OpenAI**      | https://platform.openai.com  | `OPENAI_API_KEY`           |
+
+> **Zen et Go sont deux offres distinctes, sur deux URL distinctes.** Zen
+> répond sur `/zen/v1`, Go sur `/zen/go/v1`. Utiliser la clé de l'une contre
+> l'URL de l'autre donne une erreur 403. Choisis `-p opencode` ou
+> `-p opencode-go` selon ton abonnement.
 
 Le plus simple, enregistre-la de façon **permanente** dans la config (fichier en
 permissions `600`, jamais versionné) :
@@ -457,6 +463,19 @@ ancien), `NO_COLOR=1 pia` désactive toutes les couleurs.
 
 - **« pas de clé API trouvée »** → `pia -p <fournisseur> --set-key TA_CLE`.
 - **HTTP 401 / 403** → clé invalide ou expirée, ou crédits épuisés.
+- **HTTP 403 avec « Access denied … Cloudflare »** → tu es arrêté par le
+  pare-feu du fournisseur, avant même d'atteindre l'API. Vérifie dans l'ordre :
+  1. **l'URL correspond à ton offre** — c'est la cause la plus fréquente
+     (`-p opencode` pour Zen, `-p opencode-go` pour Go) ;
+  2. la clé est bien celle de cette offre ;
+  3. le service est ouvert dans ton pays.
+
+  Tu peux aussi ajuster les en-têtes envoyés, si le fournisseur en exige un
+  particulier :
+
+  ```json
+  { "providers": { "opencode": { "headers": { "User-Agent": "..." } } } }
+  ```
 - **HTTP 404 sur le modèle** → le nom de modèle n'existe pas chez ce
   fournisseur ; ajuste avec `-m` ou dans la config.
 - **`SyntaxError`** → ton Python est trop ancien (< 3.6). Vérifie
