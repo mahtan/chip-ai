@@ -15,8 +15,8 @@ petit écran**. La commande à taper est **`pia`**.
   confirmation `y/N/a` (« a » = ne plus redemander pour cet outil).
 - **Sessions persistantes** : reprise après coupure (`--continue`), sauvegarde
   manuelle (`/save`), et suivi des tokens consommés (`/usage`).
-- Réponses **streamées** pour la réactivité même sur connexion lente, avec
-  **reprise automatique** quand le wifi du CHIP décroche.
+- Réponses **affichées mot à mot** pendant que le modèle écrit (activé par
+  défaut), avec **reprise automatique** quand le wifi du CHIP décroche.
 - **Contexte projet** (`PIA.md`), **commandes personnalisées**, mentions
   `@fichier` et raccourci shell `!` — pour taper le moins possible.
 - **Historique tronqué automatiquement** pour ne jamais saturer les 512 Mo de RAM.
@@ -291,6 +291,7 @@ Commandes du REPL :
 | `/model <nom>`      | change le modèle directement                     |
 | `/provider [nom]`   | affiche / change le fournisseur                  |
 | `/yolo`             | bascule l'auto-approbation (write/edit/run)      |
+| `/stream`           | bascule l'affichage mot à mot                    |
 | `/cwd [dossier]`    | affiche / change le dossier de travail           |
 | `/update`           | cherche et propose une mise à jour               |
 | `/save [nom]`       | sauvegarde la conversation (défaut : « manual »)  |
@@ -500,6 +501,10 @@ ancien), `NO_COLOR=1 pia` désactive toutes les couleurs.
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && . ~/.bashrc
   ```
   En dépannage immédiat : `~/.local/bin/pia` ou `python3 ~/chip-ai/pia.py`.
+- **Le texte apparaît d'un bloc au lieu de s'écrire** → l'affichage mot à mot
+  est actif par défaut. Compare avec `/stream` (qui le désactive) : si les
+  deux se ressemblent, c'est la passerelle du fournisseur qui met la réponse
+  en tampon avant de l'envoyer, et rien ne peut être fait côté client.
 - **`SyntaxError`** → ton Python est trop ancien (< 3.6). Vérifie
   `python3 --version`.
 - **L'auto-update ne trouve rien** → vérifie `repo_dir` dans

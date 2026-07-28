@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -1948,6 +1948,7 @@ fichiers & git
 divers
   /cwd [dir]    dossier de travail
   /yolo         auto-approbation
+  /stream       affichage mot a mot
   /tools /commands /update /help
   /exit         quitter (Ctrl-D aussi)
 raccourcis
@@ -1986,7 +1987,7 @@ BUILTIN_COMMANDS = [
     "/help", "/reset", "/model", "/provider", "/models", "/yolo", "/cwd",
     "/update", "/save", "/load", "/sessions", "/usage", "/context", "/env",
     "/compact", "/undo", "/diff", "/commit", "/init", "/commands", "/tools",
-    "/exit", "/quit",
+    "/exit", "/quit", "/stream",
 ]
 
 
@@ -2147,6 +2148,10 @@ def repl(cfg, provider, check_update=True, resume=False):
             elif cmd == "/yolo":
                 cfg["auto_approve"] = not cfg.get("auto_approve", False)
                 print(dim(f"auto_approve = {cfg['auto_approve']}"))
+            elif cmd == "/stream":
+                cfg["stream"] = not cfg.get("stream", True)
+                état = "mot a mot" if cfg["stream"] else "d'un bloc a la fin"
+                print(dim(f"streaming = {cfg['stream']} ({état})"))
             elif cmd == "/cwd":
                 if arg:
                     try:
