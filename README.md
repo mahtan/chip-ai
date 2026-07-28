@@ -85,6 +85,12 @@ pia -p opencode-go --set-key      # puis tape la clé, elle ne s'affiche pas
 pia -p kimi        --set-key
 ```
 
+`--set-key` **fait aussi de ce fournisseur le défaut** — sinon `pia` repart
+sur l'ancien à chaque lancement sans que tu t'en rendes compte. C'est
+précisément ce qui piège avec OpenCode : Zen et Go sont deux soldes séparés,
+et taper `pia` tout court après avoir configuré Go peut retomber sur Zen (à
+solde vide) si le défaut n'a pas suivi.
+
 > ⚠️ `pia --set-key sk-…` fonctionne aussi mais **laisse la clé dans
 > `~/.bash_history`**. `pia` t'avertit dans ce cas. Si ça t'est arrivé,
 > révoque la clé chez ton fournisseur et purge l'historique :
@@ -479,6 +485,15 @@ ancien), `NO_COLOR=1 pia` désactive toutes les couleurs.
 
 - **« pas de clé API trouvée »** → `pia -p <fournisseur> --set-key TA_CLE`.
 - **HTTP 401 / 403** → clé invalide ou expirée, ou crédits épuisés.
+- **`CreditsError: Insufficient balance` alors que ton abonnement est
+  intact** → tu es tombé sur le **mauvais fournisseur OpenCode**. Zen et Go
+  ont des soldes séparés sur des URL séparées. Vérifie lequel est actif :
+  ```sh
+  pia --config    # affiche le chemin de la config
+  grep '"provider"' ~/.config/pia/config.json
+  ```
+  Si ce n'est pas le bon, corrige avec `pia -p opencode-go --set-key` (voir
+  plus haut) ou lance simplement `pia -p opencode-go`.
 - **HTTP 403 avec « Access denied … Cloudflare »** → tu es arrêté par le
   pare-feu du fournisseur, avant même d'atteindre l'API. Vérifie dans l'ordre :
   1. **l'URL correspond à ton offre** — c'est la cause la plus fréquente

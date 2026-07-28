@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 
 APP_NAME = "pia"
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 
 # path of the currently running script (the installed binary, or pia.py in-repo)
 try:
@@ -152,8 +152,14 @@ def load_config():
     return cfg
 
 
-def save_key(provider_name, key):
-    """Persist an API key for a provider into the user config file (chmod 600)."""
+def save_key(provider_name, key, make_default=True):
+    """Persist an API key for a provider into the user config file (chmod 600).
+
+    make_default: also switch to this provider. On by default: setting a key
+    for a provider is a strong signal you mean to use it, and forgetting this
+    is exactly how you end up silently billed on the wrong one (opencode's
+    Zen and Go are separate balances on separate endpoints).
+    """
     path = config_path()
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
@@ -172,7 +178,10 @@ def save_key(provider_name, key):
             BUILTIN_PROVIDERS.get(provider_name, {})
         )
     data["providers"][provider_name]["api_key"] = key
-    data.setdefault("provider", provider_name)
+    if make_default:
+        data["provider"] = provider_name
+    else:
+        data.setdefault("provider", provider_name)
     with open(path, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
@@ -2353,6 +2362,7 @@ def main(argv=None):
             )
         path = save_key(prov_name, key)
         print(green(f"clé enregistrée pour '{prov_name}' dans {path}"))
+        print(dim(f"'{prov_name}' est maintenant le fournisseur par défaut"))
         return
 
     if args.no_stream:
