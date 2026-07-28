@@ -37,10 +37,19 @@ sh install.sh
 
 Le script :
 - copie `pia` dans `~/.local/bin`,
+- **ajoute ce dossier au `PATH`** dans `~/.profile` *et* `~/.bashrc`,
 - crée `~/.config/pia/config.json` (en migrant une éventuelle ancienne config),
 - installe deux commandes personnalisées d'exemple dans `~/.config/pia/commands/`,
 - enregistre le chemin de ce clone git pour l'**auto-update**,
 - supprime l'ancien binaire `chip` s'il traînait.
+
+> Les deux fichiers sont traités, et ce n'est pas superflu : le terminal
+> intégré du PocketCHIP lance un shell **non-connexion**, qui lit `~/.bashrc`
+> mais jamais `~/.profile`. Ne configurer que `~/.profile` donne un `pia` qui
+> marche en SSH et « commande introuvable » sur la machine elle-même.
+>
+> Ouvre un nouveau terminal après l'installation, ou fais
+> `. ~/.bashrc` dans celui en cours.
 
 Relancer `sh install.sh` plus tard **met à jour le programme** sans jamais
 écraser ta config ni tes commandes personnalisées.
@@ -484,6 +493,13 @@ ancien), `NO_COLOR=1 pia` désactive toutes les couleurs.
   ```
 - **HTTP 404 sur le modèle** → le nom de modèle n'existe pas chez ce
   fournisseur ; ajuste avec `-m` ou dans la config.
+- **`pia : commande introuvable`** → `~/.local/bin` n'est pas dans ton `PATH`.
+  Typiquement : ça marche en SSH mais pas dans le terminal du CHIP (shell
+  non-connexion). Corrige avec :
+  ```sh
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && . ~/.bashrc
+  ```
+  En dépannage immédiat : `~/.local/bin/pia` ou `python3 ~/chip-ai/pia.py`.
 - **`SyntaxError`** → ton Python est trop ancien (< 3.6). Vérifie
   `python3 --version`.
 - **L'auto-update ne trouve rien** → vérifie `repo_dir` dans

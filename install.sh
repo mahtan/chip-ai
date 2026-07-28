@@ -75,12 +75,31 @@ for f in "$SRC_DIR"/commands-example/*.md; do
 done
 echo "commandes personnalisees : $CMD_DIR"
 
-# 4. rappel PATH
+# 4. PATH : on l'ajoute vraiment, dans .profile ET .bashrc
+#    Sur le PocketCHIP, le terminal integre lance un shell NON-connexion : il
+#    lit .bashrc mais jamais .profile. Ne traiter que .profile marche en SSH
+#    puis echoue sur la machine elle-meme, ce qui est deroutant.
+PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+MARKER='# ajoute par pia (install.sh)'
+added=""
+for rc in "$HOME/.profile" "$HOME/.bashrc"; do
+  [ -e "$rc" ] || touch "$rc"
+  if ! grep -qF "$MARKER" "$rc" 2>/dev/null; then
+    printf '\n%s\n%s\n' "$MARKER" "$PATH_LINE" >> "$rc"
+    added="$added $(basename "$rc")"
+  fi
+done
+if [ -n "$added" ]; then
+  echo "PATH ajoute dans :$added"
+else
+  echo "PATH deja configure"
+fi
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) : ;;
   *)
     echo ""
-    echo "Ajoute ceci a ton ~/.profile ou ~/.bashrc :"
+    echo "Pour en profiter tout de suite dans CE terminal :"
     echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
     ;;
 esac
